@@ -12,10 +12,11 @@ ROOT = Path(__file__).resolve().parent.parent
 MCP = ROOT / "src" / "mcp.rs"
 DOCS = [ROOT / "README.md", ROOT / "docs" / "harnesses.md"]
 
-# A tool is a function under the #[tool] attribute. The attribute ends at the first `)]`,
-# because descriptions quote example text such as `[drawer]` and `[[Note Name]]`.
+# A tool is a function under the #[tool] attribute. rustfmt wraps long attributes across
+# several lines, so the attribute body may span newlines. The match is non-greedy and must
+# be followed by the fn declaration, so a `)]` inside a description can't end it early.
 TOOL = re.compile(
-    r"#\[tool\b[^\n]*?\)\]\s*\n\s*(?:pub\s+)?async\s+fn\s+(\w+)\s*\(", re.S
+    r"#\[tool\b[\s\S]*?\)\]\s*(?:pub\s+)?async\s+fn\s+(\w+)\s*\(", re.S
 )
 # The claimed total is the only bare "N tools" figure in a doc.
 CLAIM = re.compile(r"\b(\d+)\s+tools\b")
