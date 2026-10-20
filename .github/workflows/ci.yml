@@ -17,6 +17,10 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # cargo-audit is not on the runner image; this fetches a prebuilt binary.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
       - name: Known-vulnerable dependencies
         run: cargo audit
       - name: Tool count claimed in the docs
@@ -61,6 +65,8 @@ jobs:
             -o "$HOME/.local/bin/hadolint"
           chmod +x "$HOME/.local/bin/hadolint"
           hadolint --ignore DL3008 Dockerfile
+      # uvx is not on the runner image.
+      - uses: astral-sh/setup-uv@v6
       - name: Python integrations (ruff, unit tests)
         run: |
           uvx ruff check integrations/
@@ -80,6 +86,12 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      # Compose reads .env for env_file, and docs/deploy.md has backups/ created before the
+      # first run. The example's token is the one the steps below authenticate with.
+      - name: Create .env and backups/
+        run: |
+          cp .env.example .env
+          mkdir -p backups
       - name: Build and start Ubuntu container
         run: docker compose up -d --build
       - name: Wait for the container healthcheck
