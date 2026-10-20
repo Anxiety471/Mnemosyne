@@ -15,6 +15,7 @@ async fn server(s: Drawer) -> (String, tokio::task::JoinHandle<()>) {
         None,
         Some("password".into()),
         false,
+        None,
     );
     let task = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -121,6 +122,7 @@ async fn desktop_sync_roundtrip_conflict_and_offline_recovery() {
         None,
         Some("password".into()),
         false,
+        None,
     );
     let task = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();

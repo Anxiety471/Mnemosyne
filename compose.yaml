@@ -2,6 +2,8 @@ services:
   drawer:
     build: .
     restart: unless-stopped
+    # Reaps zombies if the process ever spawns children.
+    init: true
     env_file: .env
     environment:
       DRAWER_ADDR: 0.0.0.0:8787
@@ -9,13 +11,32 @@ services:
       DRAWER_UI_DIR: /usr/share/drawer/ui
     ports:
       # Access over SSH forwarding, Tailscale proxy, or a TLS reverse proxy.
-      # Do not publish the management API directly on the internet.
-      - "127.0.0.1:8787:8787"
+      # Do not publish the management API directly on the internet: only loopback is
+      # bound unless the operator overrides the port mapping.
+      - "${DRAWER_PUBLISH:-127.0.0.1:8787}:8787"
     volumes:
       - drawer_data:/data
       - ./backups:/backups
     security_opt:
       - no-new-privileges:true
+    # /data and /backups are the only writable state the app has; everything else is read-only.
+    read_only: true
+    tmpfs:
+      - /tmp
+    stop_grace_period: 30s
+    # A plain TCP connect to the bound port: no curl in the image, and it still fails when
+    # the process is deadlocked rather than merely slow to answer a request.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8787"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: ${DRAWER_MEM_LIMIT:-512M}
+          cpus: ${DRAWER_CPU_LIMIT:-1.0}
 
 volumes:
   drawer_data:

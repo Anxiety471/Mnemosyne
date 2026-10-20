@@ -15,7 +15,7 @@ One Rust binary serves a REST API, an MCP server and a web UI over the same stor
 Agents write files all day and sooner or later one of them overwrites something it shouldn't. Drawer keeps every version, puts deleted things in a trash, and lets two agents share a folder without silently clobbering each other's writes.
 
 For a private Ubuntu file-transfer server, see [deploying Drawer with Docker Compose](docs/deploy.md).
-The personal-server build supports an administrator password, resumable browser uploads, upload folders, and bulk file actions (see the stacked MVP PR).
+The personal-server build supports an administrator password, resumable browser uploads, upload folders, and bulk file actions (see the web UI features below).
 
 ## Quickstart
 
@@ -85,6 +85,7 @@ A Drive-style browser with My Drawer, Recent, Starred and Trash, a search box ov
 - **Links work.** The folder and open file are in the URL, so reload, back/forward and bookmarks do what you expect.
 - **Token prompt.** When the server runs with a token, the UI asks for it once and remembers it in the browser.
 - **Share a download.** Open a file's More actions menu, choose **Share download link**, then **Create 7-day link** and **Copy**. Reopen the menu to view expiry times or revoke an existing link. A secret is visible only when newly created, not later.
+- **Permissions.** A row's More actions menu opens **Permissions**, where you see who holds a grant on that node and can add or remove one. See [Sharing and grants](#sharing-and-grants).
 
 <p align="center">
   <img src="docs/screenshots/history.png" alt="Version history for a Markdown file" width="860"><br>
@@ -276,7 +277,13 @@ The REST API, MCP server, CLI and UI all call the same service layer, so they ag
 
 **Security for download links.** Configure a strong `DRAWER_TOKEN` before using Drawer beyond a trusted local machine. The authenticated owner can create a public, read-only capability link which anyone possessing it can download until it expires or is revoked. A valid link does **not** give access to any REST API or MCP operation. Put Drawer behind HTTPS for sharing outside your private Tailscale network, and treat the URL as a password: avoid posting it in public logs or forwarding it accidentally. A link points at the latest revision and becomes unavailable while the file or any containing folder is trashed. If the server is reachable only over Tailscale, the recipient also needs access to that tailnet or a controlled public HTTPS endpoint.
 
-**Limits.** Real user accounts don't exist yet. Actors are self-declared, so grants are cooperative, not a security boundary. Read grants aren't enforced yet. Copying folders isn't supported yet. There are no signed URLs, no blob garbage collection and no Postgres backend. Treat the optional bearer token as the access control.
+**Sharing and grants.** A node with no grants is open to every actor that can reach the store; grants only narrow access, they never widen it. `drawer_share <path> <principal> <role>` and the UI's **Permissions** dialog grant `reader`, `writer` or `owner` on a node and everything below it, and `drawer_unshare` / the same dialog remove one. The `principal` is a self-declared name, so grants are cooperative bookkeeping, not an authentication boundary. Whoever can reach the server with `DRAWER_TOKEN` (or an admin session) already has full access; put Drawer on a private network and treat the token as the access control.
+
+**Cross-origin access.** A server with no admin password and no token answers no CORS headers at all: browser pages on another origin cannot call the API. Set `DRAWER_CORS_ORIGINS` to a comma-separated list of origins to allow exactly those, for example `https://drawer.example.com`, or to `*` for the old permissive default. A server that requires a bearer token keeps the permissive `*` default, since its callers authenticate. With `DRAWER_ADMIN_PASSWORD` set, cookie auth is already refused for cross-origin requests and this variable has no effect.
+
+**Login rate limiting.** With an admin password configured, `/auth/login` allows five failed attempts per client address and username, then refuses further attempts with `429 Too Many Requests` and a `Retry-After` header. The delay doubles on each further failure, up to 15 minutes, and a successful login clears the counter. The admin password is stored as an Argon2id hash with a random salt, the same scheme named-user accounts use.
+
+**Limits.** Real user accounts don't exist yet. Actors are self-declared, so grants are cooperative, not a security boundary: a node with no grants is open to everyone who can reach the store, and a grant only narrows that. Copying folders isn't supported yet. There are no signed URLs, no blob garbage collection and no Postgres backend. Treat the optional bearer token as the access control.
 
 **Upgrading.** Stores created on the earlier path-keyed schema are migrated in place on open. Their trashed files land in the trash. Write responses changed: `created` is now `new_revision`, and `version` is now `revision`. MCP calls without an `author` used to be recorded as `agent`; they now carry the client's name, so a sharing grant written for `agent` needs the client's name instead (or start `drawer stdio` with `--author agent`). MCP tool results are compact JSON, and the listing tools return lean entries; `drawer_stat` still returns the full node.
 
@@ -288,12 +295,18 @@ The REST API, MCP server, CLI and UI all call the same service layer, so they ag
 | --- | --- | --- |
 | `DRAWER_DATA_DIR` | all store commands | `~/.drawer` |
 | `DRAWER_ADDR` | `serve` | `127.0.0.1:8787` |
+| `DRAWER_COOKIE_SECURE` | `serve` | `false`; `1` or `true` requires HTTPS |
+| `DRAWER_CORS_ORIGINS` | `serve` | unset (no CORS headers in open mode) |
+| `DRAWER_PUBLISH` | compose | `127.0.0.1:8787` |
+| `DRAWER_MEM_LIMIT` | compose | `512M` |
+| `DRAWER_CPU_LIMIT` | compose | `1.0` |
 | `DRAWER_TOKEN` | `serve` | unset (an empty value counts as unset) |
 | `DRAWER_UI_DIR` | `serve` | `./ui/dist`, then `../share/drawer/ui` beside the binary |
 | `DRAWER_AUTHOR` | CLI writes | `$USER` |
 | `DRAWER_PREFIX` | installer | `~/.local` |
 | `DRAWER_VERSION` | installer | `latest` |
 | `DRAWER_SOURCE=1` | installer | build from source instead of downloading a release |
+| `DRAWER_RUSTUP_ROOT` | installer | `https://static.rust-lang.org/rustup` |
 
 `serve` warns when it listens beyond loopback without a token.
 
@@ -306,7 +319,7 @@ cd ui && npm run build             # type-check and build ui/dist
 cargo run --release -- serve       # API, MCP and UI on http://127.0.0.1:8787
 ```
 
-CI runs clippy, the Rust tests and the UI build on every push to `main` and every pull request.
+CI runs `cargo fmt --check`, clippy, the Rust tests, `cargo audit`, the UI tests and build, `npm audit`, shellcheck, hadolint, ruff, the maintenance-script round trip, and a check that the MCP tool count in this README matches `src/mcp.rs`.
 
 Releases: pushing a `v*` tag builds Linux (x86_64, aarch64) and macOS (x86_64, aarch64) binaries and attaches them with `SHA256SUMS` (`.github/workflows/release.yml`).
 
@@ -417,6 +430,8 @@ Failed uploads refund reservations; a crash or disconnected handler can leave a
 reservation consumed, so create a replacement link if necessary. Revocation or
 folder changes are rechecked at commit. Only token hashes are stored. Treat these
 capability links as secrets; file contents are not scanned for malware.
+
+The upload page itself is `src/deposit.html`, served at `/drop/{token}`: chunked, resumable uploads (start, append at an offset, complete) with client-side SHA-256 over 256 KiB chunks, and per-file rows showing progress with Cancel and Retry. The link's budget, file size and expiry are enforced per chunk on the server.
 
 ### Named users and private quotas
 

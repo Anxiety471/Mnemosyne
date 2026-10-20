@@ -1,13 +1,22 @@
 import { useEffect, useState } from "react";
 import { api, StorageStats } from "./api";
+import { Modal } from "./Modal";
+
 const bytes = (n: number) => `${(n / 1024 / 1024).toLocaleString(undefined, { maximumFractionDigits: 2 })} MiB`;
+
 export function StoragePanel({ close }: { close: () => void }) {
   const [stats, setStats] = useState<StorageStats | null>(null);
   const [error, setError] = useState("");
-  const refresh = () => api.storage().then(setStats).catch((e) => setError(String(e)));
-  useEffect(() => { let active = true; api.storage().then((s) => { if (active) setStats(s); }).catch((e) => { if (active) setError(String(e)); }); return () => { active = false; }; }, []);
-  return <div className="modal-scrim" onMouseDown={close}><section className="modal operations-modal" role="dialog" aria-modal="true" aria-labelledby="storage-title" onMouseDown={(e) => e.stopPropagation()}>
-    <h3 id="storage-title">Storage</h3>{error && <p role="alert">{error}</p>}
+  const refresh = async () => {
+    try {
+      setStats(await api.storage());
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+  useEffect(() => { void refresh(); }, []);
+  return <Modal title="Storage" onClose={close} className="operations-modal" labelledBy="storage-title">
+    {error && <p role="alert">{error}</p>}
     {stats && <><p>{stats.live_files.toLocaleString()} live files · {stats.revisions.toLocaleString()} revisions</p>
       {stats.quota_bytes !== null && <p>Workspace quota: {bytes(stats.revision_bytes)} / {bytes(stats.quota_bytes)} used by all revisions.</p>}
       <progress aria-label="Filesystem space used" max={stats.filesystem_total_bytes} value={stats.filesystem_total_bytes - stats.filesystem_available_bytes} />
@@ -19,5 +28,5 @@ export function StoragePanel({ close }: { close: () => void }) {
       ].map(([label, value]) => <li key={label}><strong>{label}</strong><span>{bytes(Number(value))}</span></li>)}</ul>
       <p>Revision totals include trash and history. Identical content shares a blob. Filesystem space includes other applications; these figures describe a point in time.</p></>}
     <div className="modal-actions"><button className="btn" onClick={() => void refresh()}>Refresh</button><button className="btn" onClick={close}>Done</button></div>
-  </section></div>;
+  </Modal>;
 }

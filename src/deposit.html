@@ -1,7 +1,212 @@
-<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Upload to Drawer</title>
-<style>body{font:16px system-ui;background:#f6f8fa;color:#17242f;margin:0;display:grid;place-items:center;min-height:100vh}main{box-sizing:border-box;max-width:620px;width:92%;padding:36px;background:white;border:1px solid #dce3eb;border-radius:24px}button,input{font:inherit;margin:12px 0;padding:10px}progress{width:100%}#result{white-space:pre-wrap}</style>
-<main><h1>Upload to Drawer</h1><p>This link accepts files into a private folder. It does not allow browsing or downloading. Each file is limited to 512 MiB. Files receive unique names.</p><label>Select files <input id="files" type="file" multiple></label><button id="upload">Upload files</button><progress id="progress" max="100" value="0" aria-label="Upload progress"></progress><p id="result" role="status"></p></main>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="description" content="Upload files into a Drawer folder using an expiring upload-only link.">
+<meta name="color-scheme" content="light dark">
+<title>Upload to Drawer</title>
+<style>
+:root{color-scheme:light;--bg:#f8fafd;--surface:#ffffff;--surface-2:#f1f4f9;--hover:#e9eef6;--text:#1f1f1f;--muted:#5f6368;--line:#e3e7ee;--accent:#0b57d0;--accent-ink:#ffffff;--danger:#b3261e;--add:#137333;--focus:#0b57d0;--radius:12px;font-family:"Google Sans","Inter",system-ui,-apple-system,"Segoe UI",sans-serif;font-size:14px;color:var(--text)}
+@media (prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#1b1c1f;--surface:#131314;--surface-2:#26272b;--hover:#2d2f34;--text:#e3e3e3;--muted:#a8abb0;--line:#34363b;--accent:#a8c7fa;--accent-ink:#062e6f;--danger:#f2b8b5;--add:#81c995;--focus:#a8c7fa}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);display:grid;place-items:center;min-height:100vh}
+main{max-width:660px;width:94%;padding:36px;background:var(--surface);border:1px solid var(--line);border-radius:24px;box-shadow:0 1px 3px rgb(0 0 0 / .12),0 4px 16px rgb(0 0 0 / .08)}
+h1{font-size:20px;margin:0 0 8px}
+p{margin:0 0 8px}
+button,input{font:inherit;color:inherit}
+button{margin:12px 0;padding:10px 16px;border:1px solid var(--line);border-radius:var(--radius);background:var(--surface-2);cursor:pointer}
+button:hover:not(:disabled){background:var(--hover)}
+button:disabled{opacity:.55;cursor:default}
+button.primary{background:var(--accent);border-color:transparent;color:var(--accent-ink);font-weight:600}
+button.small{margin:0;padding:4px 10px;font-size:12px}
+label{color:var(--muted);font-size:13px}
+#files{display:block;margin:10px 0 0;padding:10px;width:100%;border:1px dashed var(--line);border-radius:var(--radius);background:var(--surface-2)}
+#list{list-style:none;margin:12px 0 0;padding:0;display:flex;flex-direction:column;gap:8px}
+li.row{display:flex;align-items:center;gap:10px;padding:8px 12px;border:1px solid var(--line);border-radius:var(--radius);background:var(--surface-2)}
+li.row .name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+li.row .status{flex:0 0 auto;color:var(--muted);font-size:12px;max-width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+li.row.done .status{color:var(--add)}
+li.row.error .status{color:var(--danger)}
+li.row progress{flex:0 0 80px;height:6px}
+.hint{color:var(--muted);font-size:12px;margin-top:12px}
+:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:0s!important;transition-duration:0s!important}}
+</style>
+</head>
+<body>
+<main>
+<h1>Upload to Drawer</h1>
+<p>This link accepts files into a private folder. It does not allow browsing or downloading. Each file is limited to 512 MiB. Uploads are chunked and resumable; if a connection drops, retry a file to continue where it stopped. Files receive unique names.</p>
+<form id="form">
+<label for="files">Select files</label>
+<input id="files" type="file" multiple>
+<button id="upload" class="primary" type="submit">Upload files</button>
+</form>
+<ul id="list" aria-label="Selected files"></ul>
+<p id="result" role="status" aria-live="polite"></p>
+<p class="hint" id="hint"></p>
+</main>
 <script>
-const files=document.querySelector('#files'),button=document.querySelector('#upload'),result=document.querySelector('#result'),progress=document.querySelector('#progress');
-button.onclick=async()=>{button.disabled=true;files.disabled=true;result.textContent='';try{for(const file of files.files){if(file.size>512*1024*1024)throw Error(file.name+': exceeds 512 MiB');await new Promise((resolve,reject)=>{const request=new XMLHttpRequest();request.open('POST',location.pathname+'?name='+encodeURIComponent(file.name));request.upload.onprogress=e=>{if(e.lengthComputable)progress.value=e.loaded/e.total*100};request.onload=()=>{if(request.status>=200&&request.status<300){result.textContent+='Uploaded '+file.name+'\n';resolve()}else{let message='Upload failed ('+request.status+')';try{message=JSON.parse(request.responseText).error||message}catch{}reject(Error(message))}};request.onerror=()=>reject(Error('Connection lost; select the file again to retry'));request.send(file)})}}catch(error){result.textContent+=error.message}finally{button.disabled=false;files.disabled=false}};
-</script></html>
+(function(){
+"use strict";
+var MAX=512*1024*1024,CHUNK=256*1024,SUBTLE_LIMIT=64*1024*1024;
+var form=document.getElementById('form'),fileInput=document.getElementById('files'),uploadBtn=document.getElementById('upload'),list=document.getElementById('list'),result=document.getElementById('result'),hint=document.getElementById('hint');
+var running=false;
+var K256=[0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+function rotr(x,n){return (x>>>n)|(x<<(32-n));}
+function Sha256(){this.h=[0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];this.buf=new Uint8Array(64);this.len=0;this.total=0;}
+Sha256.prototype.update=function(data){
+ var off=0;
+ if(this.len>0){var need=64-this.len,take=Math.min(need,data.length);this.buf.set(data.subarray(0,take),this.len);this.len+=take;off=take;if(this.len===64){this.compress(this.buf);this.len=0;}}
+ while(off+64<=data.length){this.compress(data.subarray(off,off+64));off+=64;}
+ if(off<data.length){this.buf.set(data.subarray(off),0);this.len=data.length-off;}
+ this.total+=data.length;
+};
+Sha256.prototype.compress=function(b){
+ var w=new Uint32Array(64),i,dv=new DataView(b.buffer,b.byteOffset,64);
+ for(i=0;i<16;i++)w[i]=dv.getUint32(i*4);
+ for(i=16;i<64;i++){var s0=rotr(w[i-15],7)^rotr(w[i-15],18)^(w[i-15]>>>3),s1=rotr(w[i-2],17)^rotr(w[i-2],19)^(w[i-2]>>>10);w[i]=(w[i-16]+s0+w[i-7]+s1)|0;}
+ var a=this.h[0],bb=this.h[1],c=this.h[2],d=this.h[3],e=this.h[4],f=this.h[5],g=this.h[6],hh=this.h[7];
+ for(i=0;i<64;i++){
+  var S1=rotr(e,6)^rotr(e,11)^rotr(e,25),ch=(e&f)^(~e&g),t1=(hh+S1+ch+K256[i]+w[i])|0,S0=rotr(a,2)^rotr(a,13)^rotr(a,22),maj=(a&bb)^(a&c)^(bb&c),t2=(S0+maj)|0;
+  hh=g;g=f;f=e;e=(d+t1)|0;d=c;c=bb;bb=a;a=(t1+t2)|0;
+ }
+ this.h[0]=(this.h[0]+a)|0;this.h[1]=(this.h[1]+bb)|0;this.h[2]=(this.h[2]+c)|0;this.h[3]=(this.h[3]+d)|0;this.h[4]=(this.h[4]+e)|0;this.h[5]=(this.h[5]+f)|0;this.h[6]=(this.h[6]+g)|0;this.h[7]=(this.h[7]+hh)|0;
+};
+Sha256.prototype.digest=function(){
+ var len=this.total*8,pad=(64-(this.len+9)%64)%64;
+ var tail=new Uint8Array(this.len+1+pad+8),dv=new DataView(tail.buffer);
+ tail.set(this.buf.subarray(0,this.len));tail[this.len]=0x80;
+ dv.setUint32(tail.length-8,Math.floor(len/4294967296));dv.setUint32(tail.length-4,len>>>0);
+ this.update(tail.subarray(this.len));
+ var hex="";
+ for(var i=0;i<8;i++){var w=this.h[i];hex+=("00000000"+(w>>>0).toString(16)).slice(-8);}
+ return hex;
+};
+/* SubtleCrypto.digest cannot stream, so it is used only up to SUBTLE_LIMIT; larger
+ * files use the incremental implementation, which reads 256 KiB slices. */
+function hashFile(file){
+ if(file.size===0)return Promise.resolve('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
+ if(window.crypto&&crypto.subtle&&file.size<=SUBTLE_LIMIT){
+  var reader=new FileReader();
+  return new Promise(function(resolve,reject){reader.onload=function(){resolve(reader.result);};reader.onerror=function(){reject(reader.error);};reader.readAsArrayBuffer(file);})
+  .then(function(buf){return crypto.subtle.digest('SHA-256',buf);})
+  .then(function(d){var b=new Uint8Array(d),h='';for(var i=0;i<b.length;i++)h+=('0'+b[i].toString(16)).slice(-2);return h;});
+ }
+ var sha=new Sha256(),offset=0;
+ return new Promise(function(resolve,reject){
+  function step(){
+   if(offset>=file.size)return resolve(sha.digest());
+   var end=Math.min(offset+CHUNK,file.size);
+   var reader=new FileReader();
+   reader.onload=function(){sha.update(new Uint8Array(reader.result));offset=end;step();};
+   reader.onerror=function(){reject(reader.error||new Error('could not read '+file.name));};
+   reader.readAsArrayBuffer(file.slice(offset,end));
+  }
+  step();
+ });
+}
+function request(method,url,body,headers,onProgress){
+ return new Promise(function(resolve,reject){
+  var x=new XMLHttpRequest();
+  x.open(method,url);
+  if(headers)for(var k in headers)x.setRequestHeader(k,headers[k]);
+  if(onProgress)x.upload.onprogress=onProgress;
+  x.onload=function(){
+   var body=null;
+   try{body=JSON.parse(x.responseText);}catch(e){}
+   if(x.status>=200&&x.status<300)resolve(body||{});
+   else{var err=body&&body.error?new Error(body.error):new Error('Upload failed ('+x.status+')');err.status=x.status;reject(err);}
+  };
+  x.onerror=function(){var err=new Error('Connection lost');err.network=true;reject(err);};
+  x.onabort=function(){var err=new Error('Cancelled');err.cancelled=true;reject(err);};
+  x.send(body);
+ });
+}
+function makeRow(file){
+ var li=document.createElement('li');li.className='row';li.dataset.state='pending';
+ var name=document.createElement('span');name.className='name';name.textContent=file.name;name.title=file.name;
+ var status=document.createElement('span');status.className='status';status.textContent='pending';
+ var bar=document.createElement('progress');bar.value=0;bar.max=100;bar.setAttribute('aria-label','Upload progress for '+file.name);
+ var cancel=document.createElement('button');cancel.className='small';cancel.type='button';cancel.textContent='Cancel';cancel.disabled=true;
+ li.appendChild(name);li.appendChild(status);li.appendChild(bar);li.appendChild(cancel);
+ list.appendChild(li);
+ return {li:li,file:file,status:status,bar:bar,cancel:cancel,sha:null,chunkId:null,cancelled:false,current:null,cancelBound:false};
+}
+function setStatus(row,text){row.status.textContent=text;}
+function setProgress(row,loaded,total){row.bar.value=total>0?Math.min(100,Math.round(loaded/total*100)):0;}
+function finish(row,error){
+ row.cancel.disabled=true;
+ row.current=null;
+ if(error){
+  row.li.dataset.state='error';row.li.classList.add('error');
+  row.status.textContent=error.message||'Upload failed';
+  var retry=document.createElement('button');retry.className='small';retry.type='button';retry.textContent='Retry';
+  retry.addEventListener('click',function(){
+   row.li.classList.remove('error');
+   row.li.dataset.state='uploading';
+   row.cancelled=false;row.current=null;
+   uploadFile(row).catch(function(){});
+  });
+  row.li.insertBefore(retry,row.cancel);
+ }else{
+  row.li.dataset.state='done';row.li.classList.add('done');row.li.classList.remove('error');
+  row.status.textContent='done ('+row.file.size+' bytes)';row.bar.value=100;
+ }
+}
+function sessionUrl(kind,chunkId){
+ var base=location.pathname.replace(/\/+$/,'');
+ if(kind==='start')return base+'/start';
+ return base+'/'+kind+'/'+encodeURIComponent(chunkId);
+}
+function uploadFile(row){
+ var file=row.file;
+ if(file.size>MAX){row.li.dataset.state='error';row.li.classList.add('error');row.status.textContent=file.name+': exceeds 512 MiB';return Promise.resolve();}
+ row.li.dataset.state='uploading';row.status.textContent='hashing '+file.name;row.cancel.disabled=false;
+ if(!row.cancelBound){row.cancelBound=true;row.cancel.addEventListener('click',function(){
+  row.cancelled=true;
+  if(row.current)row.current.abort();
+  if(row.chunkId)request('DELETE',sessionUrl('cancel',row.chunkId)).catch(function(){});
+ });}
+ function finishErr(error){ if(row.cancelled&&!error.cancelled)error.cancelled=true; finish(row,error); }
+ return hashFile(file).then(function(hex){row.sha=hex;}).catch(function(){row.sha=null;})
+ .then(function(){
+  if(row.cancelled)throw new Error('Cancelled');
+  if(!row.sha)throw new Error('hash unavailable; try Retry');
+  return request('POST',sessionUrl('start'),JSON.stringify({name:file.name,size:file.size,sha256:row.sha}),{'Content-Type':'application/json'});
+ }).then(function(started){
+  if(!started||!started.id)throw new Error('could not start upload');
+  row.chunkId=started.id;
+  var offset=started.received||0,total=file.size;
+  row.status.textContent='uploading '+file.name;
+  setProgress(row,offset,total);
+  function loop(){
+   if(row.cancelled)return;
+   if(offset>=total)return request('POST',sessionUrl('complete',row.chunkId)).then(function(){finish(row,null);});
+   var end=Math.min(offset+CHUNK,total),blob=file.slice(offset,end);
+   row.current=request('PUT',sessionUrl('append',row.chunkId),blob,{'x-upload-offset':String(offset)},function(e){if(e.lengthComputable)setProgress(row,offset+e.loaded,total)});
+   return row.current.then(function(res){offset=(res&&res.received)||end;row.current=null;loop();});
+  }
+  return loop();
+ }).catch(finishErr);
+}
+form.addEventListener('submit',function(e){
+ e.preventDefault();
+ if(running)return;
+ var files=Array.prototype.slice.call(fileInput.files||[]);
+ if(!files.length){result.textContent='Select one or more files first.';return;}
+ running=true;uploadBtn.disabled=true;result.textContent='';hint.textContent='Uploads can be resumed after a network error using Retry.';
+ var chain=Promise.resolve();
+ files.forEach(function(file){
+  var row=makeRow(file);
+  chain=chain.then(function(){return uploadFile(row);});
+ });
+ chain.then(function(){running=false;uploadBtn.disabled=false;fileInput.value='';result.textContent='All files processed.';});
+});
+if(!window.FileReader||typeof Uint8Array==='undefined'){hint.textContent='This browser cannot read files; uploads rely on server checks.';}else{hint.textContent='SHA-256 is computed in your browser before upload; the link budget, file size and expiry are enforced by the server.';}
+})();
+</script>
+</body>
+</html>

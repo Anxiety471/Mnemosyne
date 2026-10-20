@@ -3,6 +3,10 @@ on:
   push:
     branches: [main]
   pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   rust:
     runs-on: ubuntu-latest
@@ -10,8 +14,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      - name: Known-vulnerable dependencies
+        run: cargo audit
+      - name: Tool count claimed in the docs
+        run: python3 ops/check_docs_tools.py
+
   ui:
     runs-on: ubuntu-latest
     steps:
@@ -19,22 +29,68 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm ci && node --experimental-strip-types --test tests/*.test.ts && npm run build
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci --no-audit --no-fund
         working-directory: ui
+      - run: npm run typecheck
+        working-directory: ui
+      - run: npm run lint
+        working-directory: ui
+      - run: npm test
+        working-directory: ui
+      - run: npm run build
+        working-directory: ui
+      - name: Known-vulnerable dependencies (production only)
+        run: npm audit --omit=dev --audit-level=high
+        working-directory: ui
+
+  ops:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL https://github.com/koalaman/shellcheck/releases/download/stable/shellcheck-stable.linux.x86_64.tar.xz \
+            | tar -xJ --strip-components=1 -C "$HOME/.local/bin" shellcheck-stable/shellcheck
+          shellcheck ops/backup.sh ops/restore.sh install.sh
+      - name: hadolint
+        run: |
+          curl -fsSL https://github.com/hadolint/hadolint/releases/download/v2.13.1/hadolint-Linux-x86_64 \
+            -o "$HOME/.local/bin/hadolint"
+          chmod +x "$HOME/.local/bin/hadolint"
+          hadolint --ignore DL3008 Dockerfile
+      - name: Python integrations (ruff, unit tests)
+        run: |
+          uvx ruff check integrations/
+          python3 -m unittest discover -s integrations/hermes/drawer-mirror/tests -v
+      - name: Maintenance scripts and Compose
+        run: |
+          bash -n ops/backup.sh ops/restore.sh install.sh
+          sh -n install.sh
+          python3 ops/test_backup_restore.py
+          python3 ops/check_docs_tools.py
+          cp .env.example .env
+          mkdir -p backups
+          DRAWER_PUBLISH=127.0.0.1:8787 docker compose config -q
+
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Validate shell scripts and Compose
-        run: |
-          bash -n ops/backup.sh ops/restore.sh
-          python3 ops/test_backup_restore.py
-          cp .env.example .env
-          mkdir -p backups
-          docker compose config -q
       - name: Build and start Ubuntu container
         run: docker compose up -d --build
+      - name: Wait for the container healthcheck
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if docker inspect --format '{{.State.Health.Status}}' "$(docker compose ps -q drawer)" 2>/dev/null | grep -q healthy; then break; fi
+            sleep 2
+          done
+          test "$(docker inspect --format '{{.State.Health.Status}}' "$(docker compose ps -q drawer)")" = healthy
+          docker compose exec -T drawer bash -c 'exec 3<>/dev/tcp/127.0.0.1/8787 && echo health probe ok'
       - name: Verify health and auth boundary
         run: |
           set -euo pipefail

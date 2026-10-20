@@ -11,7 +11,10 @@ use std::time::Duration;
 
 use chrono::Utc;
 use serde::Serialize;
-use sqlx::{Row, Sqlite, SqlitePool, Transaction, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions, sqlite::SqliteRow};
+use sqlx::{
+    Row, Sqlite, SqlitePool, Transaction, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions,
+    sqlite::SqliteRow,
+};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -19,7 +22,10 @@ use crate::blob::BlobStore;
 use crate::error::{Error, Result};
 
 const MAX_CONTENT_SCAN: i64 = 1024 * 1024;
-/// Longest search snippet, in characters. Long lines are cut around the match.
+/// Bytes of a file search holds in memory at once. Matches spanning a boundary are found
+/// via the overlap carry in `scan_blob`.
+const SEARCH_CHUNK: usize = 64 * 1024;
+
 const SNIPPET_CHARS: usize = 160;
 /// Most nodes `walk` returns, so a recursive listing of a huge tree stays bounded.
 pub const MAX_WALK: usize = 5000;
@@ -46,6 +52,11 @@ pub struct Drawer {
     pub(crate) transfer_dir: std::path::PathBuf,
     pub(crate) transfer_lock: Arc<Mutex<()>>,
     pub(crate) deposit_lock: Arc<Mutex<()>>,
+    // Memory-vault parse cache: note node id -> (head revision, parsed tags/links). A hit
+    // means the note's blob was already read and parsed, so per-request vault work is a
+    // metadata query plus a re-parse of only the notes whose head revision changed.
+    pub(crate) vault_cache:
+        Arc<Mutex<std::collections::HashMap<String, (i64, crate::vault::Parsed)>>>,
     // Makes each check-then-write sequence one atomic step. Fine for the single-process server
     // this crate is; several processes sharing a store would need `BEGIN IMMEDIATE`.
     pub(crate) write_lock: Arc<Mutex<()>>,
@@ -153,7 +164,11 @@ pub struct WriteOpts {
 
 impl WriteOpts {
     pub fn new(author: impl Into<String>, comment: impl Into<String>) -> Self {
-        Self { author: author.into(), comment: comment.into(), ..Self::default() }
+        Self {
+            author: author.into(),
+            comment: comment.into(),
+            ..Self::default()
+        }
     }
 }
 
@@ -197,7 +212,12 @@ fn segments(norm: &str) -> Vec<&str> {
 }
 
 fn validate_name(name: &str) -> Result<()> {
-    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.chars().any(|c| c.is_control()) {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.chars().any(|c| c.is_control())
+    {
         return Err(Error::Invalid(format!("bad name {name:?}")));
     }
     Ok(())
@@ -206,14 +226,19 @@ fn validate_name(name: &str) -> Result<()> {
 /// Keys are header-safe tokens; values are bounded text.
 pub fn validate_properties(m: &Properties) -> Result<()> {
     if m.len() > MAX_PROPERTY_ENTRIES {
-        return Err(Error::Invalid(format!("at most {MAX_PROPERTY_ENTRIES} properties")));
+        return Err(Error::Invalid(format!(
+            "at most {MAX_PROPERTY_ENTRIES} properties"
+        )));
     }
     for (k, v) in m {
         let key_ok = !k.is_empty()
             && k.len() <= MAX_PROPERTY_KEY
-            && k.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+            && k.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
         if !key_ok {
-            return Err(Error::Invalid(format!("bad property key {k:?}: use 1-64 of [A-Za-z0-9-_.]")));
+            return Err(Error::Invalid(format!(
+                "bad property key {k:?}: use 1-64 of [A-Za-z0-9-_.]"
+            )));
         }
         if v.len() > MAX_PROPERTY_VALUE || v.chars().any(|c| c.is_control()) {
             return Err(Error::Invalid(format!(
@@ -225,7 +250,11 @@ pub fn validate_properties(m: &Properties) -> Result<()> {
 }
 
 fn child_path(parent: &str, name: &str) -> String {
-    if parent == "/" { format!("/{name}") } else { format!("{parent}/{name}") }
+    if parent == "/" {
+        format!("/{name}")
+    } else {
+        format!("{parent}/{name}")
+    }
 }
 
 fn parent_of(path: &str) -> String {
@@ -235,13 +264,72 @@ fn parent_of(path: &str) -> String {
     }
 }
 
+/// `/a/b/c` → `["/a", "/a/b", "/a/b/c"]`. Every path the destination parent would need.
+fn ancestor_paths(path: &str) -> Vec<String> {
+    segments(path)
+        .iter()
+        .scan(String::new(), |acc, seg| {
+            *acc = child_path(if acc.is_empty() { "/" } else { acc }, seg);
+            Some(acc.clone())
+        })
+        .collect()
+}
+
 fn name_of(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or("")
 }
 
 /// Text-like media types whose content search can scan.
 fn is_text(mime: &str) -> bool {
-    mime.starts_with("text/") || matches!(mime, "application/json" | "application/xml" | "application/yaml" | "application/toml")
+    mime.starts_with("text/")
+        || matches!(
+            mime,
+            "application/json" | "application/xml" | "application/yaml" | "application/toml"
+        )
+}
+
+/// Byte offset of the first case-insensitive match of `q` in `text`, or `None`. Compares
+/// character-by-character so multi-byte characters and expansions like `İ` are handled
+/// without lowering (and re-mapping) the whole buffer.
+fn find_match(text: &str, q: &str) -> Option<usize> {
+    if q.is_empty() {
+        return None;
+    }
+    let qchars: Vec<char> = q.chars().collect();
+    // Walk candidate start positions in char space; `text_chars` is indexed in parallel.
+    let text_chars: Vec<char> = text.chars().collect();
+    let last_start = text_chars.len().saturating_sub(1);
+    for start in 0..=last_start {
+        // Try to match the whole query beginning at `start`, character by character, where
+        // each text character's full lowercase fold must equal the next query character(s).
+        let mut qi = 0;
+        let mut ti = start;
+        while ti < text_chars.len() && qi < qchars.len() {
+            let folded: Vec<char> = text_chars[ti].to_lowercase().collect();
+            if folded.is_empty() {
+                break;
+            }
+            // The fold must consume one or more query chars exactly.
+            if qi + folded.len() > qchars.len() {
+                break;
+            }
+            if qchars[qi..qi + folded.len()] != folded[..] {
+                break;
+            }
+            qi += folded.len();
+            ti += 1;
+        }
+        if qi == qchars.len() {
+            // Matched: return the byte offset of `start`.
+            return Some(
+                text.char_indices()
+                    .nth(start)
+                    .map(|(b, _)| b)
+                    .unwrap_or(text.len()),
+            );
+        }
+    }
+    None
 }
 
 /// A line trimmed to at most `SNIPPET_CHARS` characters, keeping the match in view.
@@ -252,8 +340,13 @@ fn snippet(line: &str, lowered_query: &str) -> String {
         return line.to_string();
     }
     // Lowercasing can change lengths for a few scripts; the estimate only places the window.
-    let at = line.to_lowercase().find(lowered_query).map_or(0, |b| line.to_lowercase()[..b].chars().count());
-    let start = at.saturating_sub(SNIPPET_CHARS / 3).min(chars.len() - SNIPPET_CHARS);
+    let at = line
+        .to_lowercase()
+        .find(lowered_query)
+        .map_or(0, |b| line.to_lowercase()[..b].chars().count());
+    let start = at
+        .saturating_sub(SNIPPET_CHARS / 3)
+        .min(chars.len() - SNIPPET_CHARS);
     let end = start + SNIPPET_CHARS;
     let mut out: String = chars[start..end].iter().collect();
     if start > 0 {
@@ -337,10 +430,14 @@ fn apply_edit(text: &str, e: &Edit) -> std::result::Result<String, String> {
         (e.old.clone(), e.new.clone())
     };
     match text.matches(&old).count() {
-        0 => Err("old text not found; re-read the file and copy it exactly, including whitespace".into()),
+        0 => Err(
+            "old text not found; re-read the file and copy it exactly, including whitespace".into(),
+        ),
         1 => Ok(text.replacen(&old, &new, 1)),
         _ if e.replace_all => Ok(text.replace(&old, &new)),
-        n => Err(format!("old text appears {n} times; include more surrounding text to make it unique, or set replace_all")),
+        n => Err(format!(
+            "old text appears {n} times; include more surrounding text to make it unique, or set replace_all"
+        )),
     }
 }
 
@@ -361,8 +458,7 @@ const NODE_SELECT: &str = "SELECT n.id, n.parent_id, n.name, n.kind, n.owner, n.
     n.starred, n.created_at, n.modified_at, r.hash, r.size, r.mime, r.author, r.properties \
     FROM nodes n LEFT JOIN revisions r ON r.node_id = n.id AND r.revision = n.head_revision";
 
-const REVISION_SELECT: &str =
-    "SELECT node_id, revision, hash, size, mime, author, comment, properties, created_at FROM revisions";
+const REVISION_SELECT: &str = "SELECT node_id, revision, hash, size, mime, author, comment, properties, created_at FROM revisions";
 
 fn node_from_row(r: &SqliteRow, path: String) -> Node {
     let props: Option<String> = r.get("properties");
@@ -371,14 +467,18 @@ fn node_from_row(r: &SqliteRow, path: String) -> Node {
         parent_id: r.get("parent_id"),
         name: r.get("name"),
         path,
-        kind: if r.get::<String, _>("kind") == "folder" { "folder" } else { "file" },
+        kind: if r.get::<String, _>("kind") == "folder" {
+            "folder"
+        } else {
+            "file"
+        },
         owner: r.get("owner"),
         head_revision: r.get("head_revision"),
         hash: r.get("hash"),
         size: r.get("size"),
         mime: r.get("mime"),
         modified_by: r.get("author"),
-        properties: props.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or_default(),
+        properties: parse_props(props.as_deref(), &r.get::<String, _>("id")),
         trashed: r.get::<i64, _>("trashed") != 0,
         starred: r.get::<i64, _>("starred") != 0,
         created_at: r.get("created_at"),
@@ -396,14 +496,31 @@ fn revision_from_row(r: &SqliteRow) -> Revision {
         mime: r.get("mime"),
         author: r.get("author"),
         comment: r.get("comment"),
-        properties: serde_json::from_str(&props).unwrap_or_default(),
+        properties: parse_props(Some(&props), &r.get::<String, _>("node_id")),
         created_at: r.get("created_at"),
+    }
+}
+
+/// Stored properties are user-controlled JSON. A corrupt value (hand-edited row, partial
+/// write) must not take down every read: log it and fall back to empty.
+fn parse_props(raw: Option<&str>, id: &str) -> Properties {
+    match raw {
+        Some(p) => match serde_json::from_str(p) {
+            Ok(props) => props,
+            Err(e) => {
+                tracing::warn!(node = id, error = %e, properties = %p, "ignoring unreadable properties");
+                Properties::new()
+            }
+        },
+        None => Properties::new(),
     }
 }
 
 /// `if_head_revision` against the live head (`None` when there is no live file).
 fn check_precondition(path: &str, live: Option<i64>, expected: Option<i64>) -> Result<()> {
-    let Some(expected) = expected else { return Ok(()) };
+    let Some(expected) = expected else {
+        return Ok(());
+    };
     let ok = match live {
         None => expected == 0,
         Some(cur) => expected == cur,
@@ -421,11 +538,17 @@ fn check_precondition(path: &str, live: Option<i64>, expected: Option<i64>) -> R
 enum Slot {
     Live(String),
     Revive(String),
-    Create { anchor: String, missing: Vec<String> },
+    Create {
+        anchor: String,
+        missing: Vec<String>,
+    },
 }
 
 async fn columns(pool: &SqlitePool, table: &str) -> Result<Vec<String>> {
-    Ok(sqlx::query_scalar("SELECT name FROM pragma_table_info(?)").bind(table).fetch_all(pool).await?)
+    Ok(sqlx::query_scalar("SELECT name FROM pragma_table_info(?)")
+        .bind(table)
+        .fetch_all(pool)
+        .await?)
 }
 
 async fn insert_node(
@@ -472,14 +595,24 @@ async fn migrate_legacy(pool: &SqlitePool) -> Result<()> {
             .get(&parent_of(&path))
             .cloned()
             .ok_or_else(|| Error::Internal(format!("legacy folder {path} has no parent")))?;
-        let id = insert_node(&mut tx, &parent, name_of(&path), "folder", "migrated", &created).await?;
+        let id = insert_node(
+            &mut tx,
+            &parent,
+            name_of(&path),
+            "folder",
+            "migrated",
+            &created,
+        )
+        .await?;
         ids.insert(path, id);
     }
 
     let mut file_nodes: HashMap<i64, String> = HashMap::new();
-    let files = sqlx::query("SELECT id, path, current_version, deleted, created_at, updated_at FROM files ORDER BY id")
-        .fetch_all(&mut *tx)
-        .await?;
+    let files = sqlx::query(
+        "SELECT id, path, current_version, deleted, created_at, updated_at FROM files ORDER BY id",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
     for r in files {
         let path: String = r.get("path");
         let parent = ids
@@ -487,14 +620,24 @@ async fn migrate_legacy(pool: &SqlitePool) -> Result<()> {
             .cloned()
             .ok_or_else(|| Error::Internal(format!("legacy file {path} has no parent folder")))?;
         let created: String = r.get("created_at");
-        let id = insert_node(&mut tx, &parent, name_of(&path), "file", "migrated", &created).await?;
-        sqlx::query("UPDATE nodes SET head_revision = ?, trashed = ?, modified_at = ? WHERE id = ?")
-            .bind(r.get::<i64, _>("current_version"))
-            .bind(r.get::<i64, _>("deleted"))
-            .bind(r.get::<String, _>("updated_at"))
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?;
+        let id = insert_node(
+            &mut tx,
+            &parent,
+            name_of(&path),
+            "file",
+            "migrated",
+            &created,
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE nodes SET head_revision = ?, trashed = ?, modified_at = ? WHERE id = ?",
+        )
+        .bind(r.get::<i64, _>("current_version"))
+        .bind(r.get::<i64, _>("deleted"))
+        .bind(r.get::<String, _>("updated_at"))
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
         file_nodes.insert(r.get("id"), id);
     }
 
@@ -522,7 +665,9 @@ async fn migrate_legacy(pool: &SqlitePool) -> Result<()> {
     }
 
     for table in ["versions", "files", "folders"] {
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP TABLE {table}"))).execute(&mut *tx).await?;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP TABLE {table}")))
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
     Ok(())
@@ -530,16 +675,31 @@ async fn migrate_legacy(pool: &SqlitePool) -> Result<()> {
 
 impl Drawer {
     /// Open (or create) a store rooted at `data_dir`: `drawer.db` plus `blobs/`.
-    pub async fn open(data_dir: &Path) -> Result<Self> { Self::open_leased(data_dir, false).await }
+    pub async fn open(data_dir: &Path) -> Result<Self> {
+        Self::open_leased(data_dir, false).await
+    }
 
     /// Offline maintenance excludes all current Drawer processes using this store.
-    pub async fn open_maintenance(data_dir: &Path) -> Result<Self> { Self::open_leased(data_dir, true).await }
+    pub async fn open_maintenance(data_dir: &Path) -> Result<Self> {
+        Self::open_leased(data_dir, true).await
+    }
 
     async fn open_leased(data_dir: &Path, exclusive: bool) -> Result<Self> {
         tokio::fs::create_dir_all(data_dir).await?;
-        let lease = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(data_dir.join(".maintenance.lock"))?;
-        let locked = if exclusive { fs2::FileExt::try_lock_exclusive(&lease) } else { fs2::FileExt::try_lock_shared(&lease) };
-        locked.map_err(|_| Error::Conflict("store is in use; stop Drawer before offline maintenance".into()))?;
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(data_dir.join(".maintenance.lock"))?;
+        let locked = if exclusive {
+            fs2::FileExt::try_lock_exclusive(&lease)
+        } else {
+            fs2::FileExt::try_lock_shared(&lease)
+        };
+        locked.map_err(|_| {
+            Error::Conflict("store is in use; stop Drawer before offline maintenance".into())
+        })?;
         let opts = SqliteConnectOptions::new()
             .filename(data_dir.join("drawer.db"))
             .create_if_missing(true)
@@ -553,8 +713,13 @@ impl Drawer {
             .pragma("temp_store", "memory");
         // Schema and migrations run on a single connection that is closed before the shared
         // pool opens, so no pooled connection ever holds a plan from the old schema.
-        let setup = SqlitePoolOptions::new().max_connections(1).connect_with(opts.clone()).await?;
-        sqlx::raw_sql(include_str!("schema.sql")).execute(&setup).await?;
+        let setup = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts.clone())
+            .await?;
+        sqlx::raw_sql(include_str!("schema.sql"))
+            .execute(&setup)
+            .await?;
         migrate_legacy(&setup).await?;
         setup.close().await;
         let pool = SqlitePool::connect_with(opts).await?;
@@ -569,29 +734,45 @@ impl Drawer {
             transfer_dir: data_dir.join("transfers"),
             transfer_lock: Arc::new(Mutex::new(())),
             deposit_lock: Arc::new(Mutex::new(())),
+            vault_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
             write_lock: Arc::new(Mutex::new(())),
         })
     }
 
     pub(crate) async fn check_quota(&self, additional: i64) -> Result<()> {
         let quota = self.quota.load(std::sync::atomic::Ordering::Acquire);
-        if quota == i64::MAX { return Ok(()); }
-        let used: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size),0) FROM revisions").fetch_one(&self.pool).await?;
-        if used.saturating_add(additional) > quota { return Err(Error::Forbidden("storage quota exceeded; history and trash count toward quota".into())); }
+        if quota == i64::MAX {
+            return Ok(());
+        }
+        let used: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size),0) FROM revisions")
+            .fetch_one(&self.pool)
+            .await?;
+        if used.saturating_add(additional) > quota {
+            return Err(Error::Forbidden(
+                "storage quota exceeded; history and trash count toward quota".into(),
+            ));
+        }
         Ok(())
     }
 
     // ----- lookups -------------------------------------------------------------------------
 
     /// Id and kind of a child by name. `trashed` picks which side of the trash to look at.
-    async fn child(&self, parent: &str, name: &str, trashed: bool) -> Result<Option<(String, String)>> {
-        Ok(sqlx::query("SELECT id, kind FROM nodes WHERE parent_id = ? AND name = ? AND trashed = ?")
-            .bind(parent)
-            .bind(name)
-            .bind(trashed as i64)
-            .fetch_optional(&self.pool)
-            .await?
-            .map(|r| (r.get("id"), r.get("kind"))))
+    async fn child(
+        &self,
+        parent: &str,
+        name: &str,
+        trashed: bool,
+    ) -> Result<Option<(String, String)>> {
+        Ok(sqlx::query(
+            "SELECT id, kind FROM nodes WHERE parent_id = ? AND name = ? AND trashed = ?",
+        )
+        .bind(parent)
+        .bind(name)
+        .bind(trashed as i64)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|r| (r.get("id"), r.get("kind"))))
     }
 
     async fn path_of(&self, id: &str) -> Result<String> {
@@ -623,7 +804,11 @@ impl Drawer {
             .map(|r| {
                 let start: String = r.get("start");
                 // The root's own row has an empty name and no parent.
-                let path = if start == ROOT_ID { "/".to_string() } else { format!("/{}", r.get::<String, _>("path")) };
+                let path = if start == ROOT_ID {
+                    "/".to_string()
+                } else {
+                    format!("/{}", r.get::<String, _>("path"))
+                };
                 (start, path)
             })
             .collect())
@@ -689,18 +874,28 @@ impl Drawer {
                         return Ok(Slot::Live(cid));
                     }
                     if kind == "file" {
-                        return Err(Error::Conflict(format!("/{} is a file", segs[..=i].join("/"))));
+                        return Err(Error::Conflict(format!(
+                            "/{} is a file",
+                            segs[..=i].join("/")
+                        )));
                     }
                     anchor = cid;
                 }
                 None => {
-                    let trashed = if last { self.child(&anchor, seg, true).await? } else { None };
+                    let trashed = if last {
+                        self.child(&anchor, seg, true).await?
+                    } else {
+                        None
+                    };
                     if let Some((tid, kind)) = trashed
                         && kind == "file"
                     {
                         return Ok(Slot::Revive(tid));
                     }
-                    return Ok(Slot::Create { anchor, missing: segs[i..].iter().map(|s| s.to_string()).collect() });
+                    return Ok(Slot::Create {
+                        anchor,
+                        missing: segs[i..].iter().map(|s| s.to_string()).collect(),
+                    });
                 }
             }
         }
@@ -754,12 +949,16 @@ impl Drawer {
             return Ok(());
         }
         let needed = if need == OWNER { "owner" } else { "writer" };
-        Err(Error::Forbidden(format!("{actor} needs {needed} access to this node")))
+        Err(Error::Forbidden(format!(
+            "{actor} needs {needed} access to this node"
+        )))
     }
 
     /// Result of SQLite's `PRAGMA quick_check`: `ok` for a healthy database.
     pub async fn integrity_check(&self) -> Result<String> {
-        Ok(sqlx::query_scalar("PRAGMA quick_check").fetch_one(&self.pool).await?)
+        Ok(sqlx::query_scalar("PRAGMA quick_check")
+            .fetch_one(&self.pool)
+            .await?)
     }
 
     pub async fn stats(&self) -> Result<Stats> {
@@ -782,7 +981,9 @@ impl Drawer {
 
     /// Blob hashes that a revision points at but that are missing from disk.
     pub async fn missing_blobs(&self) -> Result<Vec<String>> {
-        let rows = sqlx::query("SELECT DISTINCT hash FROM revisions ORDER BY hash").fetch_all(&self.pool).await?;
+        let rows = sqlx::query("SELECT DISTINCT hash FROM revisions ORDER BY hash")
+            .fetch_all(&self.pool)
+            .await?;
         let mut missing = Vec::new();
         for r in rows {
             let hash: String = r.get("hash");
@@ -802,10 +1003,12 @@ impl Drawer {
             .await?
             .filter(|n| n.kind == "folder")
             .ok_or_else(|| Error::NotFound(format!("folder {path}")))?;
-        let rows = sqlx::query(sqlx::AssertSqlSafe(format!("{NODE_SELECT} WHERE n.parent_id = ? AND n.trashed = 0 ORDER BY n.name")))
-            .bind(&folder.id)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "{NODE_SELECT} WHERE n.parent_id = ? AND n.trashed = 0 ORDER BY n.name"
+        )))
+        .bind(&folder.id)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows
             .iter()
             .map(|r| {
@@ -828,7 +1031,11 @@ impl Drawer {
     }
 
     /// Resolve a file revision to its content-addressed on-disk path for streamed HTTP downloads.
-    pub async fn read_file_path(&self, r: Ref<'_>, revision: Option<i64>) -> Result<(Revision, std::path::PathBuf)> {
+    pub async fn read_file_path(
+        &self,
+        r: Ref<'_>,
+        revision: Option<i64>,
+    ) -> Result<(Revision, std::path::PathBuf)> {
         let node = self.resolve(r).await?;
         let rev = self.revision_row(&node.id, revision).await?;
         let path = self.blobs.path_for(&rev.hash)?;
@@ -842,24 +1049,30 @@ impl Drawer {
         let node = self.node(node_id, None).await?;
         let want = match revision {
             Some(n) => n,
-            None => node.head_revision.ok_or_else(|| Error::Invalid(format!("{} is a folder", node.path)))?,
+            None => node
+                .head_revision
+                .ok_or_else(|| Error::Invalid(format!("{} is a folder", node.path)))?,
         };
-        let r = sqlx::query(sqlx::AssertSqlSafe(format!("{REVISION_SELECT} WHERE node_id = ? AND revision = ?")))
-            .bind(node_id)
-            .bind(want)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or_else(|| Error::NotFound(format!("{} revision {want}", node.path)))?;
+        let r = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "{REVISION_SELECT} WHERE node_id = ? AND revision = ?"
+        )))
+        .bind(node_id)
+        .bind(want)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| Error::NotFound(format!("{} revision {want}", node.path)))?;
         Ok(revision_from_row(&r))
     }
 
     /// All revisions of a file, newest first.
     pub async fn revisions(&self, r: Ref<'_>) -> Result<Vec<Revision>> {
         let node = self.resolve(r).await?;
-        let rows = sqlx::query(sqlx::AssertSqlSafe(format!("{REVISION_SELECT} WHERE node_id = ? ORDER BY revision DESC")))
-            .bind(&node.id)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "{REVISION_SELECT} WHERE node_id = ? ORDER BY revision DESC"
+        )))
+        .bind(&node.id)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows.iter().map(revision_from_row).collect())
     }
 
@@ -874,9 +1087,11 @@ impl Drawer {
     }
 
     pub async fn starred(&self) -> Result<Vec<Node>> {
-        let rows = sqlx::query(sqlx::AssertSqlSafe(format!("{NODE_SELECT} WHERE n.starred = 1 AND n.trashed = 0 ORDER BY n.name")))
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "{NODE_SELECT} WHERE n.starred = 1 AND n.trashed = 0 ORDER BY n.name"
+        )))
+        .fetch_all(&self.pool)
+        .await?;
         let mut nodes = self.nodes_with_paths(&rows).await?;
         nodes.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(nodes)
@@ -919,7 +1134,11 @@ impl Drawer {
         .fetch_all(&self.pool)
         .await?;
         let truncated = rows.len() > MAX_WALK;
-        let base = if folder.path == "/" { String::new() } else { folder.path.clone() };
+        let base = if folder.path == "/" {
+            String::new()
+        } else {
+            folder.path.clone()
+        };
         let nodes = rows
             .iter()
             .take(MAX_WALK)
@@ -929,13 +1148,18 @@ impl Drawer {
     }
 
     pub async fn permissions(&self, id: &str) -> Result<Vec<Permission>> {
-        let rows = sqlx::query("SELECT principal, role FROM permissions WHERE node_id = ? ORDER BY principal")
-            .bind(id)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query(
+            "SELECT principal, role FROM permissions WHERE node_id = ? ORDER BY principal",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows
             .iter()
-            .map(|r| Permission { principal: r.get("principal"), role: r.get("role") })
+            .map(|r| Permission {
+                principal: r.get("principal"),
+                role: r.get("role"),
+            })
             .collect())
     }
 
@@ -955,39 +1179,116 @@ impl Drawer {
         let mut files = self.nodes_with_paths(&rows).await?;
         files.sort_by(|a, b| a.path.cmp(&b.path));
 
-        let (named, rest): (Vec<Node>, Vec<Node>) = files.into_iter().partition(|f| f.path.to_lowercase().contains(&q));
+        let (named, rest): (Vec<Node>, Vec<Node>) = files
+            .into_iter()
+            .partition(|f| f.path.to_lowercase().contains(&q));
         let mut hits: Vec<SearchHit> = named
             .into_iter()
             .take(limit)
-            .map(|f| SearchHit { id: f.id, path: f.path, matched: "name", snippet: String::new(), line: None })
+            .map(|f| SearchHit {
+                id: f.id,
+                path: f.path,
+                matched: "name",
+                snippet: String::new(),
+                line: None,
+            })
             .collect();
         for f in rest {
             if hits.len() >= limit {
                 break;
             }
-            let (Some(size), Some(mime), Some(hash)) = (f.size, f.mime.as_deref(), f.hash.as_deref()) else {
+            let (Some(size), Some(mime), Some(hash)) =
+                (f.size, f.mime.as_deref(), f.hash.as_deref())
+            else {
                 continue;
             };
             if size > MAX_CONTENT_SCAN || !is_text(mime) {
                 continue;
             }
-            let data = self.blobs.get(hash).await?;
-            let Ok(text) = std::str::from_utf8(&data) else { continue };
-            // Cheap whole-file check first; most files don't match.
-            if !text.to_lowercase().contains(&q) {
-                continue;
-            }
-            if let Some((i, line)) = text.lines().enumerate().find(|(_, l)| l.to_lowercase().contains(&q)) {
+            if let Some((line, text)) = self.scan_blob(hash, &q).await? {
                 hits.push(SearchHit {
                     id: f.id,
                     path: f.path,
                     matched: "content",
-                    snippet: snippet(line, &q),
-                    line: Some(i + 1),
+                    snippet: snippet(&text, &q),
+                    line: Some(line),
                 });
             }
         }
         Ok(hits)
+    }
+
+    /// Find the first case-insensitive match of `q` in a blob, streaming it in fixed-size
+    /// chunks so a large file is never held in memory. Returns the 1-based line number and the
+    /// original line text containing the match.
+    async fn scan_blob(&self, hash: &str, q: &str) -> Result<Option<(usize, String)>> {
+        use tokio::io::AsyncReadExt;
+        let mut reader = self.blobs.stream_chunks(hash, SEARCH_CHUNK).await?;
+        // `buf` holds the not-yet-ruled-out tail of the file. `lines_before` counts complete
+        // lines fully before `buf`, so a match's line number is exact.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut lines_before: usize = 0;
+        let mut chunk = vec![0u8; SEARCH_CHUNK];
+        loop {
+            let n = reader.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            // Never split a multi-byte character: keep any incomplete tail for next round.
+            let good = match std::str::from_utf8(&chunk[..n]) {
+                Ok(_) => n,
+                Err(e) => e.valid_up_to(),
+            };
+            // `good` may be less than `n`; the remainder is carried by re-reading is not
+            // possible, so it is kept here and prepended to the next chunk's work by virtue of
+            // staying in `buf` only if it can still match — which it cannot be dropped below.
+            buf.extend_from_slice(&chunk[..good]);
+            let text = match std::str::from_utf8(&buf) {
+                Ok(t) => t.to_string(),
+                Err(_) => return Ok(None), // invalid UTF-8: not searchable text
+            };
+            if let Some(m) = find_match(&text, q) {
+                let line_start = text[..m].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let line_no = lines_before + text[..m].matches('\n').count() + 1;
+                // The line may run past what we have buffered; read to its end.
+                let line_end = text[m..].find('\n').map(|i| m + i).unwrap_or(text.len());
+                let mut line_bytes = text.as_bytes()[line_start..line_end].to_vec();
+                if line_end == text.len() {
+                    let mut tail = Vec::new();
+                    let mut rest = [0u8; 8192];
+                    loop {
+                        let k = reader.read(&mut rest).await?;
+                        if k == 0 {
+                            break;
+                        }
+                        if let Some(pos) = rest[..k].iter().position(|&b| b == b'\n') {
+                            tail.extend_from_slice(&rest[..pos]);
+                            break;
+                        }
+                        tail.extend_from_slice(&rest[..k]);
+                    }
+                    line_bytes.extend_from_slice(&tail);
+                }
+                let line_text = String::from_utf8_lossy(&line_bytes).into_owned();
+                return Ok(Some((line_no, line_text)));
+            }
+            // No match: drop everything that cannot still begin a match. Keep the last
+            // `q.len() - 1` bytes (the overlap across the chunk boundary) and never cut a
+            // line, so line numbers and the snippet stay exact.
+            let carry = q.len().saturating_sub(1);
+            if buf.len() > carry {
+                let mut drop = buf.len() - carry;
+                while drop > 0 && buf[drop - 1] != b'\n' {
+                    drop -= 1;
+                }
+                if drop > 0 {
+                    let dropped: String = String::from_utf8_lossy(&buf[..drop]).into_owned();
+                    lines_before += dropped.matches('\n').count();
+                    buf.drain(..drop);
+                }
+            }
+        }
+        Ok(None)
     }
 
     // ----- writes --------------------------------------------------------------------------
@@ -1031,24 +1332,48 @@ impl Drawer {
         validate_properties(&opts.properties)?;
         let _quota = self.quota_lock.lock().await;
         if let Err(error) = self.check_quota(data.len() as i64).await
-            && !self.blobs.contains(&BlobStore::hash(data)).await? { return Err(error); }
+            && !self.blobs.contains(&BlobStore::hash(data)).await?
+        {
+            return Err(error);
+        }
         let hash = self.blobs.put(data).await?;
         let mime = guess_mime(&norm, data);
-        self.commit_blob(&norm, &hash, data.len() as i64, &mime, &opts.properties, &opts).await
+        self.commit_blob(
+            &norm,
+            &hash,
+            data.len() as i64,
+            &mime,
+            &opts.properties,
+            &opts,
+        )
+        .await
     }
 
     /// Commit a staged transfer without loading the full file into memory.
     pub async fn write_staged(
-        &self, path: &str, staged: &Path, opts: WriteOpts, expected_hash: Option<&str>,
+        &self,
+        path: &str,
+        staged: &Path,
+        opts: WriteOpts,
+        expected_hash: Option<&str>,
     ) -> Result<WriteOutcome> {
         let norm = normalize(path)?;
-        if norm == "/" { return Err(Error::Invalid("cannot write to root".into())); }
+        if norm == "/" {
+            return Err(Error::Invalid("cannot write to root".into()));
+        }
         validate_properties(&opts.properties)?;
         let _quota = self.quota_lock.lock().await;
-        self.check_quota(tokio::fs::metadata(staged).await?.len() as i64).await?;
-        let (hash, size) = self.blobs.put_file_checked(staged, expected_hash).await?;
+        // Mirror `write()`: bytes already in the store don't count against the quota, so
+        // re-uploading identical content never fails. Hash first, then charge what's new.
+        let (hash, size, created) = self.blobs.put_file_checked(staged, expected_hash).await?;
         if expected_hash.is_some_and(|expected| expected != hash) {
-            return Err(Error::Invalid("uploaded file SHA-256 checksum mismatch".into()));
+            return Err(Error::Invalid(
+                "uploaded file SHA-256 checksum mismatch".into(),
+            ));
+        }
+        // The blob now exists, so `contains` is always true; use `created` to decide.
+        if created {
+            self.check_quota(size).await?;
         }
         let mut file = tokio::fs::File::open(staged).await?;
         use tokio::io::AsyncReadExt;
@@ -1056,17 +1381,32 @@ impl Drawer {
         let n = file.read(&mut sample).await?;
         sample.truncate(n);
         let mime = guess_mime(&norm, &sample);
-        self.commit_blob(&norm, &hash, size, &mime, &opts.properties, &opts).await
+        self.commit_blob(&norm, &hash, size, &mime, &opts.properties, &opts)
+            .await
     }
 
     // Roll back newly unreferenced bytes on failed named-user writes. The quota guard
     // serializes blob writers; metadata is rechecked against copies under write_lock.
-    async fn commit_blob(&self, norm: &str, hash: &str, size: i64, mime: &str, properties: &Properties, opts: &WriteOpts) -> Result<WriteOutcome> {
+    async fn commit_blob(
+        &self,
+        norm: &str,
+        hash: &str,
+        size: i64,
+        mime: &str,
+        properties: &Properties,
+        opts: &WriteOpts,
+    ) -> Result<WriteOutcome> {
         let result = self.commit(norm, hash, size, mime, properties, opts).await;
         if result.is_err() && self.quota.load(std::sync::atomic::Ordering::Acquire) != i64::MAX {
             let _guard = self.write_lock.lock().await;
-            let referenced: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM revisions WHERE hash=?)").bind(hash).fetch_one(&self.pool).await?;
-            if !referenced { let _ = tokio::fs::remove_file(self.blobs.path_for(hash)?).await; }
+            let referenced: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM revisions WHERE hash=?)")
+                    .bind(hash)
+                    .fetch_one(&self.pool)
+                    .await?;
+            if !referenced {
+                let _ = tokio::fs::remove_file(self.blobs.path_for(hash)?).await;
+            }
         }
         result
     }
@@ -1083,8 +1423,15 @@ impl Drawer {
     ) -> Result<WriteOutcome> {
         let _guard = self.write_lock.lock().await;
         if let Some(parent) = &opts.required_parent {
-            let path = norm.rsplit_once('/').map(|(p,_)| if p.is_empty() { "/" } else { p }).unwrap_or("/");
-            if self.stat(Ref::Path(path)).await?.id != *parent { return Err(Error::PreconditionFailed("destination folder changed".into())); }
+            let path = norm
+                .rsplit_once('/')
+                .map(|(p, _)| if p.is_empty() { "/" } else { p })
+                .unwrap_or("/");
+            if self.stat(Ref::Path(path)).await?.id != *parent {
+                return Err(Error::PreconditionFailed(
+                    "destination folder changed".into(),
+                ));
+            }
         }
         let slot = self.slot(norm).await?;
 
@@ -1105,15 +1452,25 @@ impl Drawer {
 
         let props_json = serde_json::to_string(properties).expect("string map serializes");
         if let Slot::Live(id) = &slot {
-            let head = live_head.expect("a live file has a head revision");
-            let same = sqlx::query("SELECT hash, properties FROM revisions WHERE node_id = ? AND revision = ?")
-                .bind(id)
-                .bind(head)
-                .fetch_one(&self.pool)
-                .await?;
-            if same.get::<String, _>("hash") == hash && same.get::<String, _>("properties") == props_json {
+            let head = live_head.ok_or_else(|| {
+                Error::Internal(format!("node {id} is live but has no head revision"))
+            })?;
+            let same = sqlx::query(
+                "SELECT hash, properties FROM revisions WHERE node_id = ? AND revision = ?",
+            )
+            .bind(id)
+            .bind(head)
+            .fetch_one(&self.pool)
+            .await?;
+            if same.get::<String, _>("hash") == hash
+                && same.get::<String, _>("properties") == props_json
+            {
                 let node = self.node(id, Some(norm.to_string())).await?;
-                return Ok(WriteOutcome { node, revision: head, new_revision: false });
+                return Ok(WriteOutcome {
+                    node,
+                    revision: head,
+                    new_revision: false,
+                });
             }
         }
 
@@ -1133,15 +1490,26 @@ impl Drawer {
             Slot::Create { anchor, missing } => {
                 let mut parent = anchor.clone();
                 for dir in &missing[..missing.len() - 1] {
-                    parent = insert_node(&mut tx, &parent, dir, "folder", &opts.author, &ts).await?;
+                    parent =
+                        insert_node(&mut tx, &parent, dir, "folder", &opts.author, &ts).await?;
                 }
-                insert_node(&mut tx, &parent, &missing[missing.len() - 1], "file", &opts.author, &ts).await?
+                insert_node(
+                    &mut tx,
+                    &parent,
+                    &missing[missing.len() - 1],
+                    "file",
+                    &opts.author,
+                    &ts,
+                )
+                .await?
             }
         };
-        let next: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(revision), 0) + 1 FROM revisions WHERE node_id = ?")
-            .bind(&node_id)
-            .fetch_one(&mut *tx)
-            .await?;
+        let next: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(revision), 0) + 1 FROM revisions WHERE node_id = ?",
+        )
+        .bind(&node_id)
+        .fetch_one(&mut *tx)
+        .await?;
         sqlx::query(
             "INSERT INTO revisions (node_id, revision, hash, size, mime, author, comment, properties, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1165,26 +1533,45 @@ impl Drawer {
             .await?;
         tx.commit().await?;
         let node = self.node(&node_id, Some(norm.to_string())).await?;
-        Ok(WriteOutcome { node, revision: next, new_revision: true })
+        Ok(WriteOutcome {
+            node,
+            revision: next,
+            new_revision: true,
+        })
     }
 
     /// Change part of a text file: each edit replaces `old` with `new`, in order. The result is
     /// written as one new revision, guarded on the head revision that was edited, so a write
     /// that lands in between makes this fail instead of being overwritten. Properties carry over
     /// from the head unless `opts` sets some.
-    pub async fn edit(&self, path: &str, edits: &[Edit], mut opts: WriteOpts) -> Result<WriteOutcome> {
+    pub async fn edit(
+        &self,
+        path: &str,
+        edits: &[Edit],
+        mut opts: WriteOpts,
+    ) -> Result<WriteOutcome> {
         if edits.is_empty() {
             return Err(Error::Invalid("no edits given".into()));
         }
         let node = self.resolve(Ref::Path(path)).await?;
-        let head = node.head_revision.ok_or_else(|| Error::Invalid(format!("{} is a folder", node.path)))?;
+        let head = node
+            .head_revision
+            .ok_or_else(|| Error::Invalid(format!("{} is a folder", node.path)))?;
         check_precondition(&node.path, Some(head), opts.if_head_revision)?;
         let (rev, data) = self.read(Ref::Id(&node.id), Some(head)).await?;
-        let mut text = String::from_utf8(data)
-            .map_err(|_| Error::Invalid(format!("{} is binary ({}); only text files can be edited", node.path, rev.mime)))?;
+        let mut text = String::from_utf8(data).map_err(|_| {
+            Error::Invalid(format!(
+                "{} is binary ({}); only text files can be edited",
+                node.path, rev.mime
+            ))
+        })?;
         for (i, e) in edits.iter().enumerate() {
             text = apply_edit(&text, e).map_err(|msg| {
-                let which = if edits.len() > 1 { format!("edit {}: ", i + 1) } else { String::new() };
+                let which = if edits.len() > 1 {
+                    format!("edit {}: ", i + 1)
+                } else {
+                    String::new()
+                };
                 Error::Invalid(format!("{which}{msg} in {} (revision {head})", node.path))
             })?;
         }
@@ -1197,9 +1584,17 @@ impl Drawer {
 
     /// Unified diff between two revisions of a text file. `to` defaults to the head and
     /// `from` to the revision before `to`; revision 0 stands for an empty file.
-    pub async fn diff(&self, r: Ref<'_>, from: Option<i64>, to: Option<i64>, context: usize) -> Result<Diff> {
+    pub async fn diff(
+        &self,
+        r: Ref<'_>,
+        from: Option<i64>,
+        to: Option<i64>,
+        context: usize,
+    ) -> Result<Diff> {
         let node = self.resolve(r).await?;
-        let head = node.head_revision.ok_or_else(|| Error::Invalid(format!("{} is a folder", node.path)))?;
+        let head = node
+            .head_revision
+            .ok_or_else(|| Error::Invalid(format!("{} is a folder", node.path)))?;
         let to = to.unwrap_or(head);
         let from = from.unwrap_or(to - 1).max(0);
         let text_of = |rev: i64| {
@@ -1210,7 +1605,10 @@ impl Drawer {
                 }
                 let (meta, data) = self.read(Ref::Id(&node.id), Some(rev)).await?;
                 String::from_utf8(data).map_err(|_| {
-                    Error::Invalid(format!("{} revision {rev} is binary ({}); only text can be diffed", node.path, meta.mime))
+                    Error::Invalid(format!(
+                        "{} revision {rev} is binary ({}); only text can be diffed",
+                        node.path, meta.mime
+                    ))
                 })
             }
         };
@@ -1229,10 +1627,20 @@ impl Drawer {
         } else {
             td.unified_diff()
                 .context_radius(context)
-                .header(&format!("{}@{from}", node.path), &format!("{}@{to}", node.path))
+                .header(
+                    &format!("{}@{from}", node.path),
+                    &format!("{}@{to}", node.path),
+                )
                 .to_string()
         };
-        Ok(Diff { path: node.path, from, to, added, removed, diff })
+        Ok(Diff {
+            path: node.path,
+            from,
+            to,
+            added,
+            removed,
+            diff,
+        })
     }
 
     /// Copy one revision of a file to `to`, which may be the file's own path (a new revision
@@ -1246,18 +1654,26 @@ impl Drawer {
     ) -> Result<WriteOutcome> {
         let src = self.resolve(from).await?;
         if src.kind == "folder" {
-            return Err(Error::Invalid("copying folders is not supported yet".into()));
+            return Err(Error::Invalid(
+                "copying folders is not supported yet".into(),
+            ));
         }
         let to = normalize(to)?;
         if to == "/" {
             return Err(Error::Invalid("cannot write to the root".into()));
         }
         let rev = self.revision_row(&src.id, source_revision).await?;
-        self.commit(&to, &rev.hash, rev.size, &rev.mime, &rev.properties, &opts).await
+        self.commit(&to, &rev.hash, rev.size, &rev.mime, &rev.properties, &opts)
+            .await
     }
 
     /// Roll back by making an old revision the newest one. History is never rewritten.
-    pub async fn rollback(&self, r: Ref<'_>, revision: i64, mut opts: WriteOpts) -> Result<WriteOutcome> {
+    pub async fn rollback(
+        &self,
+        r: Ref<'_>,
+        revision: i64,
+        mut opts: WriteOpts,
+    ) -> Result<WriteOutcome> {
         let node = self.resolve(r).await?;
         if node.trashed {
             return Err(Error::NotFound(format!("{} is in the trash", node.path)));
@@ -1265,7 +1681,8 @@ impl Drawer {
         if opts.comment.is_empty() {
             opts.comment = format!("rollback to revision {revision}");
         }
-        self.copy(Ref::Id(&node.id), &node.path, Some(revision), opts).await
+        self.copy(Ref::Id(&node.id), &node.path, Some(revision), opts)
+            .await
     }
 
     /// Rename, move, star, trash or restore a node. Trashing a folder trashes everything under
@@ -1321,23 +1738,38 @@ impl Drawer {
             .execute(&mut *tx)
             .await?;
         }
-        sqlx::query("UPDATE nodes SET parent_id = ?, name = ?, starred = ?, modified_at = ? WHERE id = ?")
-            .bind(&new_parent)
-            .bind(&new_name)
-            .bind(u.starred.unwrap_or(cur.starred) as i64)
-            .bind(&ts)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE nodes SET parent_id = ?, name = ?, starred = ?, modified_at = ? WHERE id = ?",
+        )
+        .bind(&new_parent)
+        .bind(&new_name)
+        .bind(u.starred.unwrap_or(cur.starred) as i64)
+        .bind(&ts)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         self.node(id, None).await
     }
 
     /// Trash a file or folder, with an optional precondition on its head revision.
-    pub async fn trash(&self, r: Ref<'_>, if_head_revision: Option<i64>, actor: &str) -> Result<Node> {
+    pub async fn trash(
+        &self,
+        r: Ref<'_>,
+        if_head_revision: Option<i64>,
+        actor: &str,
+    ) -> Result<Node> {
         let node = self.resolve(r).await?;
         check_precondition(&node.path, node.head_revision, if_head_revision)?;
-        self.update(&node.id, NodeUpdate { trashed: Some(true), ..NodeUpdate::default() }, actor).await
+        self.update(
+            &node.id,
+            NodeUpdate {
+                trashed: Some(true),
+                ..NodeUpdate::default()
+            },
+            actor,
+        )
+        .await
     }
 
     /// Rename or move a live node to `to`, creating the destination's parent folders.
@@ -1347,11 +1779,66 @@ impl Drawer {
         if norm == "/" {
             return Err(Error::Invalid("cannot move to the root".into()));
         }
-        let parent = self.mkdir(&parent_of(&norm), actor).await?;
-        let name = name_of(&norm).to_string();
+        // A rename in place changes nothing.
+        if norm == node.path && name_of(&norm) == node.name {
+            return self.node(&node.id, Some(norm)).await;
+        }
+        // Validate before any folder is created: a refused move must leave no trace.
+        let name = name_of(&norm);
+        validate_name(name)?;
+        let parent_path = parent_of(&norm);
+        // A file sitting in the way of a new destination parent, e.g. /x/f when moving
+        // /y to /x/f/g.txt.
+        for ancestor in ancestor_paths(&parent_path) {
+            if let Some(n) = self.lookup(&ancestor).await?
+                && n.kind == "file"
+            {
+                return Err(Error::Conflict(format!("{ancestor} is a file")));
+            }
+        }
+        // Check the clash before creating folders when the parent already exists.
+        if let Some(p) = self.lookup(&parent_path).await?
+            && p.kind == "folder"
+            && self
+                .child(&p.id, name, false)
+                .await?
+                .is_some_and(|(cid, _)| cid != node.id)
+        {
+            return Err(Error::Conflict(format!("{name} already exists there")));
+        }
+        // The parent must exist (creating it happens below, after these checks) and the
+        // mover must be able to write the destination parent: update() re-checks it too, but
+        // only after mkdir() may have created folders.
+        let parent = match self.lookup(&parent_path).await? {
+            None => self.mkdir(&parent_path, actor).await?,
+            Some(p) if p.kind == "file" => {
+                return Err(Error::Conflict(format!("{parent_path} is a file")));
+            }
+            Some(p) => p,
+        };
+        if node.id == parent.id || self.is_ancestor_or_self(&node.id, &parent.id).await? {
+            return Err(Error::Invalid("cannot move a folder into itself".into()));
+        }
+        if node.trashed {
+            return Err(Error::NotFound(format!("{} is in the trash", node.path)));
+        }
+        // update() checks this too, but before folders are created.
+        self.authorize(&node.id, actor, WRITER).await?;
+        self.authorize(&parent.id, actor, WRITER).await?;
+        if self
+            .child(&parent.id, name, false)
+            .await?
+            .is_some_and(|(cid, _)| cid != node.id)
+        {
+            return Err(Error::Conflict(format!("{name} already exists there")));
+        }
         self.update(
             &node.id,
-            NodeUpdate { parent_id: Some(parent.id), name: Some(name), ..NodeUpdate::default() },
+            NodeUpdate {
+                parent_id: Some(parent.id),
+                name: Some(name.to_string()),
+                ..NodeUpdate::default()
+            },
             actor,
         )
         .await
@@ -1366,27 +1853,45 @@ impl Drawer {
         let _guard = self.write_lock.lock().await;
         let node = self.node(id, None).await?;
         if !node.trashed {
-            return Err(Error::Conflict(format!("move {} to the trash before deleting it forever", node.path)));
+            return Err(Error::Conflict(format!(
+                "move {} to the trash before deleting it forever",
+                node.path
+            )));
         }
         self.authorize(id, actor, OWNER).await?;
         let subtree = "(WITH RECURSIVE sub(id) AS (SELECT ? UNION ALL SELECT n.id FROM nodes n JOIN sub ON n.parent_id = sub.id) SELECT id FROM sub)";
         let mut tx = self.pool.begin().await?;
         for table in ["revisions", "permissions"] {
-            sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table} WHERE node_id IN {subtree}")))
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE node_id IN {subtree}"
+            )))
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         }
-        sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM nodes WHERE id IN {subtree}"))).bind(id).execute(&mut *tx).await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM nodes WHERE id IN {subtree}"
+        )))
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
 
     /// Replace the grant for `principal` on a node. Roles: reader, writer, owner.
-    pub async fn share(&self, id: &str, principal: &str, role: &str, actor: &str) -> Result<Vec<Permission>> {
+    pub async fn share(
+        &self,
+        id: &str,
+        principal: &str,
+        role: &str,
+        actor: &str,
+    ) -> Result<Vec<Permission>> {
         validate_name(principal)?;
         if rank(role) == 0 {
-            return Err(Error::Invalid(format!("role must be reader, writer or owner, not {role:?}")));
+            return Err(Error::Invalid(format!(
+                "role must be reader, writer or owner, not {role:?}"
+            )));
         }
         let _guard = self.write_lock.lock().await;
         self.authorize(id, actor, OWNER).await?;
@@ -1412,7 +1917,9 @@ impl Drawer {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(Error::NotFound(format!("no grant for {principal} on this node")));
+            return Err(Error::NotFound(format!(
+                "no grant for {principal} on this node"
+            )));
         }
         self.permissions(id).await
     }

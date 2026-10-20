@@ -68,6 +68,10 @@ a { cursor: pointer; }
 .muted { color: var(--muted); }
 .small { font-size: 12px; }
 .spacer { flex: 1; }
+/* Visible only to screen readers. */
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+.skip-link { position: absolute; left: 12px; top: -48px; z-index: 40; padding: 8px 14px; border-radius: 999px; background: var(--accent); color: var(--accent-ink); text-decoration: none; transition: top .15s; }
+.skip-link:focus-visible { top: 12px; }
 
 .shell { display: flex; flex-direction: column; height: 100vh; }
 
@@ -80,6 +84,7 @@ a { cursor: pointer; }
 .search:focus-within { background: var(--surface); box-shadow: var(--shadow); }
 .search input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; font-size: 15px; color: var(--text); }
 .search input:focus-visible { outline: 0; }
+.search:focus-within { box-shadow: var(--shadow), 0 0 0 2px var(--focus); }
 .kbd { display: inline-grid; place-items: center; min-width: 22px; height: 22px; margin-right: 10px; padding: 0 6px; border: 1px solid var(--line); border-radius: 6px; font: 12px ui-monospace, "SF Mono", monospace; color: var(--muted); background: var(--surface); }
 
 /* Layout */
@@ -204,7 +209,7 @@ tr:hover .row-actions, tr.menu-open .row-actions, .row-actions:focus-within { op
 .diff-row.del { background: var(--del-soft); }
 .diff-row.hunk { color: var(--muted); background: var(--surface-2); padding: 2px 0; }
 .diff-row.hunk .diff-text { grid-column: 1 / -1; padding-left: 16px; }
-.diff-num { text-align: right; padding-right: 8px; color: var(--muted); opacity: .7; user-select: none; }
+.diff-num { text-align: right; padding-right: 8px; color: var(--muted); user-select: none; }
 .diff-sign { text-align: center; user-select: none; }
 .diff-row.add .diff-sign { color: var(--add); }
 .diff-row.del .diff-sign { color: var(--del); }
@@ -224,7 +229,7 @@ tr:hover .row-actions, tr.menu-open .row-actions, .row-actions:focus-within { op
 
 .code { flex: 1; display: flex; min-height: 0; font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace; font-size: 13px; line-height: 20px; }
 .code.readonly { background: var(--surface-2); }
-.gutter { padding: 16px 10px 16px 14px; text-align: right; color: var(--muted); opacity: .7; user-select: none; overflow: hidden; border-right: 1px solid var(--line); min-width: 48px; }
+.gutter { padding: 16px 10px 16px 14px; text-align: right; color: var(--muted); user-select: none; overflow: hidden; border-right: 1px solid var(--line); min-width: 48px; }
 .code-area { position: relative; flex: 1; min-width: 0; }
 .code-hl, .code-input { position: absolute; inset: 0; margin: 0; padding: 16px 20px; font: inherit; line-height: inherit; white-space: pre; overflow: auto; tab-size: 2; border: 0; }
 .code-hl { pointer-events: none; background: transparent !important; color: var(--text); }
@@ -352,7 +357,12 @@ tr:hover .row-actions, tr.menu-open .row-actions, .row-actions:focus-within { op
   .content { margin-right: 8px; }
   .col-md, .col-sm { display: none; }
   .col-actions { width: 124px; }
-  .history { display: none; }
+  /* The history panel becomes a bottom sheet instead of disappearing. */
+  .history {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 15; width: auto; max-height: 60vh;
+    border-left: 0; border-top: 1px solid var(--line); border-radius: 16px 16px 0 0;
+    background: var(--surface); box-shadow: var(--shadow); padding-bottom: 24px;
+  }
   .row-actions { opacity: 1; }
 }
 
@@ -394,11 +404,11 @@ button.nav { border: 0; background: none; font: inherit; cursor: pointer; text-a
 
 .memory-tags { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
 .memory-tag { height: 28px; padding: 0 12px; font-size: 13px; }
-.memory-meta { display: block; margin-top: 12px; font-size: 12px; color: var(--muted, inherit); opacity: 0.7; }
+.memory-meta { display: block; margin-top: 12px; font-size: 12px; color: var(--muted); }
 .memory-modal { max-width: 960px; }
 .memory-graph { position: relative; margin-top: 10px; }
 .memory-graph canvas { width: 100%; height: 480px; display: block; border: 1px solid var(--line); border-radius: 12px; cursor: grab; touch-action: none; }
-.memory-graph-hint { margin-top: 8px; font-size: 13px; opacity: 0.75; }
+.memory-graph-hint { margin-top: 8px; font-size: 13px; color: var(--muted); }
 .memory-key { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
 .memory-key i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
 .memory-graph canvas { height: 440px; }

@@ -12,7 +12,10 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rmcp::{
     RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig, ToolAnnotations},
+    model::{
+        CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig,
+        ToolAnnotations,
+    },
     schemars,
     service::RequestContext,
     tool, tool_handler, tool_router,
@@ -44,7 +47,12 @@ impl DrawerMcp {
             tool.title = Some(title.into());
             tool.annotations = Some(ann);
         }
-        Self { svc, author: None, verified_actor: None, tool_router }
+        Self {
+            svc,
+            author: None,
+            verified_actor: None,
+            tool_router,
+        }
     }
 
     /// Record `author` on changes when a call doesn't name one. Empty means unset.
@@ -59,11 +67,16 @@ impl DrawerMcp {
         self
     }
 
-    pub fn with_verified_actor(mut self, actor: String) -> Self { self.verified_actor = Some(actor); self }
+    pub fn with_verified_actor(mut self, actor: String) -> Self {
+        self.verified_actor = Some(actor);
+        self
+    }
 
     /// Who a call acts as: its `author`, else the configured author, else the client's name.
     fn actor(&self, author: Option<String>, ctx: &RequestContext<RoleServer>) -> String {
-        if let Some(actor) = &self.verified_actor { return actor.clone(); }
+        if let Some(actor) = &self.verified_actor {
+            return actor.clone();
+        }
         author
             .filter(|a| !a.trim().is_empty())
             .or_else(|| self.author.clone())
@@ -293,8 +306,13 @@ fn portable_schema(v: Value) -> Value {
                     "type" => {
                         let ty = match v {
                             Value::Array(types) => {
-                                let mut types: Vec<Value> = types.into_iter().filter(|t| t != "null").collect();
-                                if types.len() == 1 { types.remove(0) } else { Value::Array(types) }
+                                let mut types: Vec<Value> =
+                                    types.into_iter().filter(|t| t != "null").collect();
+                                if types.len() == 1 {
+                                    types.remove(0)
+                                } else {
+                                    Value::Array(types)
+                                }
                             }
                             other => other,
                         };
@@ -314,9 +332,21 @@ fn portable_schema(v: Value) -> Value {
 
 /// A display title plus hints that let harnesses auto-approve safe calls and confirm risky ones.
 fn annotations_for(name: &str) -> (&'static str, ToolAnnotations) {
-    let read = |title| (title, ToolAnnotations::new().open_world(false).read_only(true));
+    let read = |title| {
+        (
+            title,
+            ToolAnnotations::new().open_world(false).read_only(true),
+        )
+    };
     let change = |title, destructive, idempotent| {
-        (title, ToolAnnotations::new().open_world(false).read_only(false).destructive(destructive).idempotent(idempotent))
+        (
+            title,
+            ToolAnnotations::new()
+                .open_world(false)
+                .read_only(false)
+                .destructive(destructive)
+                .idempotent(idempotent),
+        )
     };
     match name {
         "drawer_list" => read("List folder"),
@@ -417,10 +447,22 @@ fn window(text: &str, offset: Option<usize>, limit: Option<usize>) -> (String, O
         last += 1;
     }
     if last < start {
-        return (String::new(), Some(format!("offset {start} is past the end: the file has {total} lines")));
+        return (
+            String::new(),
+            Some(format!(
+                "offset {start} is past the end: the file has {total} lines"
+            )),
+        );
     }
-    let more = if last < total { format!("; pass offset={} to continue", last + 1) } else { String::new() };
-    (out, Some(format!("showing lines {start}-{last} of {total}{more}")))
+    let more = if last < total {
+        format!("; pass offset={} to continue", last + 1)
+    } else {
+        String::new()
+    };
+    (
+        out,
+        Some(format!("showing lines {start}-{last} of {total}{more}")),
+    )
 }
 
 /// Images small enough to hand to a vision model directly.
@@ -435,57 +477,115 @@ fn base64_wanted(encoding: &Option<String>) -> Result<bool, String> {
     match encoding.as_deref() {
         None | Some("text") | Some("utf8") | Some("utf-8") => Ok(false),
         Some("base64") => Ok(true),
-        Some(other) => Err(format!("unknown encoding {other:?}; use \"text\" or \"base64\"")),
+        Some(other) => Err(format!(
+            "unknown encoding {other:?}; use \"text\" or \"base64\""
+        )),
     }
 }
 
 #[tool_router]
 impl DrawerMcp {
-    #[tool(description = "List the live files and folders inside a folder (default /). Pass depth > 1 to list everything below it in one call. Each entry has its path, kind, id, revision, size and who changed it last.")]
+    #[tool(
+        description = "List the live files and folders inside a folder (default /). Pass depth > 1 to list everything below it in one call. Each entry has its path, kind, id, revision, size and who changed it last."
+    )]
     async fn drawer_list(&self, Parameters(a): Parameters<ListArg>) -> Result<String, String> {
-        let path = a.path.as_deref().filter(|p| !p.trim().is_empty()).unwrap_or("/");
+        let path = a
+            .path
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or("/");
         let depth = a.depth.unwrap_or(1).clamp(1, 10);
         if depth == 1 {
-            return json(entries(&self.svc.list(path).await.map_err(|e| e.to_string())?));
+            return json(entries(
+                &self.svc.list(path).await.map_err(|e| e.to_string())?,
+            ));
         }
-        let (nodes, truncated) = self.svc.walk(path, depth).await.map_err(|e| e.to_string())?;
+        let (nodes, truncated) = self
+            .svc
+            .walk(path, depth)
+            .await
+            .map_err(|e| e.to_string())?;
         if truncated {
             return json(serde_json::json!({ "entries": entries(&nodes), "truncated": true }));
         }
         json(entries(&nodes))
     }
 
-    #[tool(description = "Create a folder, including any missing parents. Returns the folder's node.")]
-    async fn drawer_mkdir(&self, Parameters(a): Parameters<MkdirArg>, ctx: RequestContext<RoleServer>) -> Result<String, String> {
-        json(self.svc.mkdir(&a.path, &self.actor(a.author, &ctx)).await.map_err(|e| e.to_string())?)
+    #[tool(
+        description = "Create a folder, including any missing parents. Returns the folder's node."
+    )]
+    async fn drawer_mkdir(
+        &self,
+        Parameters(a): Parameters<MkdirArg>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
+        json(
+            self.svc
+                .mkdir(&a.path, &self.actor(a.author, &ctx))
+                .await
+                .map_err(|e| e.to_string())?,
+        )
     }
 
-    #[tool(description = "Read a file (the head revision unless one is given). Text comes back as text followed by a [drawer] line with the revision to pass as if_head_revision when writing. Large text files are cut at 2000 lines; page with offset and limit. PNG, JPEG, GIF and WebP images come back as image content. Pass encoding \"base64\" for other binary files such as PDF, docx or xlsx.")]
-    async fn drawer_read(&self, Parameters(a): Parameters<ReadArg>) -> Result<CallToolResult, String> {
-        let (rev, data) = self.svc.read(Ref::Path(&a.path), a.revision).await.map_err(|e| e.to_string())?;
+    #[tool(
+        description = "Read a file (the head revision unless one is given). Text comes back as text followed by a [drawer] line with the revision to pass as if_head_revision when writing. Large text files are cut at 2000 lines; page with offset and limit. PNG, JPEG, GIF and WebP images come back as image content. Pass encoding \"base64\" for other binary files such as PDF, docx or xlsx."
+    )]
+    async fn drawer_read(
+        &self,
+        Parameters(a): Parameters<ReadArg>,
+    ) -> Result<CallToolResult, String> {
+        let (rev, data) = self
+            .svc
+            .read(Ref::Path(&a.path), a.revision)
+            .await
+            .map_err(|e| e.to_string())?;
         if base64_wanted(&a.encoding)? {
-            return Ok(CallToolResult::success(vec![ContentBlock::text(BASE64.encode(data))]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                BASE64.encode(data),
+            )]));
         }
         // Raster images come back as MCP image content, so vision models can look at them.
-        let viewable = matches!(rev.mime.as_str(), "image/png" | "image/jpeg" | "image/gif" | "image/webp");
+        let viewable = matches!(
+            rev.mime.as_str(),
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        );
         if a.encoding.is_none() && viewable && data.len() <= MAX_INLINE_IMAGE {
             return Ok(CallToolResult::success(vec![
-                ContentBlock::text(format!("{} (revision {}, {}, {} bytes)", a.path, rev.revision, rev.mime, rev.size)),
+                ContentBlock::text(format!(
+                    "{} (revision {}, {}, {} bytes)",
+                    a.path, rev.revision, rev.mime, rev.size
+                )),
                 ContentBlock::image(BASE64.encode(data), rev.mime),
             ]));
         }
-        let text = String::from_utf8(data)
-            .map_err(|_| format!("{} is binary ({}); read it with encoding \"base64\"", a.path, rev.mime))?;
+        let text = String::from_utf8(data).map_err(|_| {
+            format!(
+                "{} is binary ({}); read it with encoding \"base64\"",
+                a.path, rev.mime
+            )
+        })?;
         let (body, range) = window(&text, a.offset, a.limit);
-        let mut meta = format!("[drawer] {} revision {}, {}, {} bytes", a.path, rev.revision, rev.mime, rev.size);
+        let mut meta = format!(
+            "[drawer] {} revision {}, {}, {} bytes",
+            a.path, rev.revision, rev.mime, rev.size
+        );
         if let Some(range) = range {
             meta.push_str(&format!(", {range}"));
         }
-        Ok(CallToolResult::success(vec![ContentBlock::text(body), ContentBlock::text(meta)]))
+        Ok(CallToolResult::success(vec![
+            ContentBlock::text(body),
+            ContentBlock::text(meta),
+        ]))
     }
 
-    #[tool(description = "Create or overwrite a whole file. Every change becomes a new revision. For a small change to an existing text file, drawer_edit is cheaper. Pass encoding \"base64\" to store binary files such as PDF, docx, xlsx or images. Returns new_revision=false when nothing changed.")]
-    async fn drawer_write(&self, Parameters(a): Parameters<WriteArg>, ctx: RequestContext<RoleServer>) -> Result<String, String> {
+    #[tool(
+        description = "Create or overwrite a whole file. Every change becomes a new revision. For a small change to an existing text file, drawer_edit is cheaper. Pass encoding \"base64\" to store binary files such as PDF, docx, xlsx or images. Returns new_revision=false when nothing changed."
+    )]
+    async fn drawer_write(
+        &self,
+        Parameters(a): Parameters<WriteArg>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
         let opts = WriteOpts {
             author: self.actor(a.author, &ctx),
             comment: a.comment.unwrap_or_default(),
@@ -494,64 +594,140 @@ impl DrawerMcp {
             required_parent: None,
         };
         let data = if base64_wanted(&a.encoding)? {
-            BASE64.decode(a.content.trim()).map_err(|e| format!("content is not valid base64: {e}"))?
+            BASE64
+                .decode(a.content.trim())
+                .map_err(|e| format!("content is not valid base64: {e}"))?
         } else {
             a.content.into_bytes()
         };
-        let out = self.svc.write(&a.path, &data, opts).await.map_err(|e| e.to_string())?;
-        json(written(&out))
-    }
-
-    #[tool(description = "Edit a text file by replacing old_string with new_string, saved as one new revision. old_string must match the file exactly and appear once (or set replace_all). Safe with other writers: if the file changes during the edit, nothing is saved and you get an error to retry.")]
-    async fn drawer_edit(&self, Parameters(a): Parameters<EditArg>, ctx: RequestContext<RoleServer>) -> Result<String, String> {
-        let mut opts = WriteOpts::new(self.actor(a.author, &ctx), a.comment.unwrap_or_default());
-        opts.if_head_revision = a.if_head_revision;
-        let edit = Edit { old: a.old_string, new: a.new_string, replace_all: a.replace_all.unwrap_or(false) };
-        let out = self.svc.edit(&a.path, &[edit], opts).await.map_err(|e| e.to_string())?;
-        json(written(&out))
-    }
-
-    #[tool(description = "Move a file or folder to the trash. Restore it with drawer_restore, or delete it forever with drawer_purge.")]
-    async fn drawer_delete(&self, Parameters(a): Parameters<DeleteArg>, ctx: RequestContext<RoleServer>) -> Result<String, String> {
-        let node = self
+        let out = self
             .svc
-            .trash(Ref::Path(&a.path), a.if_head_revision, &self.actor(a.author, &ctx))
+            .write(&a.path, &data, opts)
             .await
             .map_err(|e| e.to_string())?;
-        json(serde_json::json!({ "trashed": node.path, "id": node.id, "restore_with": "drawer_restore" }))
+        json(written(&out))
     }
 
-    #[tool(description = "Show a node's full metadata: id, kind, head revision, hash, size, mime, owner, who changed it last, starred, trashed, properties, timestamps.")]
+    #[tool(
+        description = "Edit a text file by replacing old_string with new_string, saved as one new revision. old_string must match the file exactly and appear once (or set replace_all). Safe with other writers: if the file changes during the edit, nothing is saved and you get an error to retry."
+    )]
+    async fn drawer_edit(
+        &self,
+        Parameters(a): Parameters<EditArg>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
+        let mut opts = WriteOpts::new(self.actor(a.author, &ctx), a.comment.unwrap_or_default());
+        opts.if_head_revision = a.if_head_revision;
+        let edit = Edit {
+            old: a.old_string,
+            new: a.new_string,
+            replace_all: a.replace_all.unwrap_or(false),
+        };
+        let out = self
+            .svc
+            .edit(&a.path, &[edit], opts)
+            .await
+            .map_err(|e| e.to_string())?;
+        json(written(&out))
+    }
+
+    #[tool(
+        description = "Move a file or folder to the trash. Restore it with drawer_restore, or delete it forever with drawer_purge."
+    )]
+    async fn drawer_delete(
+        &self,
+        Parameters(a): Parameters<DeleteArg>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
+        let node = self
+            .svc
+            .trash(
+                Ref::Path(&a.path),
+                a.if_head_revision,
+                &self.actor(a.author, &ctx),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        json(
+            serde_json::json!({ "trashed": node.path, "id": node.id, "restore_with": "drawer_restore" }),
+        )
+    }
+
+    #[tool(
+        description = "Show a node's full metadata: id, kind, head revision, hash, size, mime, owner, who changed it last, starred, trashed, properties, timestamps."
+    )]
     async fn drawer_stat(&self, Parameters(a): Parameters<PathArg>) -> Result<String, String> {
-        json(self.svc.stat(Ref::Path(&a.path)).await.map_err(|e| e.to_string())?)
+        json(
+            self.svc
+                .stat(Ref::Path(&a.path))
+                .await
+                .map_err(|e| e.to_string())?,
+        )
     }
 
-    #[tool(description = "List all revisions of a file, newest first, with author, comment, size and time.")]
+    #[tool(
+        description = "List all revisions of a file, newest first, with author, comment, size and time."
+    )]
     async fn drawer_revisions(&self, Parameters(a): Parameters<PathArg>) -> Result<String, String> {
-        json(self.svc.revisions(Ref::Path(&a.path)).await.map_err(|e| e.to_string())?)
+        json(
+            self.svc
+                .revisions(Ref::Path(&a.path))
+                .await
+                .map_err(|e| e.to_string())?,
+        )
     }
 
-    #[tool(description = "Show what changed in a text file between two revisions, as a unified diff. Defaults to the latest change (head vs the revision before it).")]
+    #[tool(
+        description = "Show what changed in a text file between two revisions, as a unified diff. Defaults to the latest change (head vs the revision before it)."
+    )]
     async fn drawer_diff(&self, Parameters(a): Parameters<DiffArg>) -> Result<String, String> {
         let d = self
             .svc
-            .diff(Ref::Path(&a.path), a.from_revision, a.to_revision, a.context.unwrap_or(3).min(50))
+            .diff(
+                Ref::Path(&a.path),
+                a.from_revision,
+                a.to_revision,
+                a.context.unwrap_or(3).min(50),
+            )
             .await
             .map_err(|e| e.to_string())?;
-        let summary = format!("{} revision {} -> {}: +{} -{} lines", d.path, d.from, d.to, d.added, d.removed);
-        Ok(if d.diff.is_empty() { format!("{summary} (no changes)") } else { format!("{summary}\n{}", d.diff) })
+        let summary = format!(
+            "{} revision {} -> {}: +{} -{} lines",
+            d.path, d.from, d.to, d.added, d.removed
+        );
+        Ok(if d.diff.is_empty() {
+            format!("{summary} (no changes)")
+        } else {
+            format!("{summary}\n{}", d.diff)
+        })
     }
 
-    #[tool(description = "Make an earlier revision the head revision. Adds a new revision with the old content; history is kept.")]
-    async fn drawer_rollback(&self, Parameters(a): Parameters<RollbackArg>, ctx: RequestContext<RoleServer>) -> Result<String, String> {
+    #[tool(
+        description = "Make an earlier revision the head revision. Adds a new revision with the old content; history is kept."
+    )]
+    async fn drawer_rollback(
+        &self,
+        Parameters(a): Parameters<RollbackArg>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
         let mut opts = WriteOpts::new(self.actor(a.author, &ctx), "");
         opts.if_head_revision = a.if_head_revision;
-        let out = self.svc.rollback(Ref::Path(&a.path), a.revision, opts).await.map_err(|e| e.to_string())?;
+        let out = self
+            .svc
+            .rollback(Ref::Path(&a.path), a.revision, opts)
+            .await
+            .map_err(|e| e.to_string())?;
         json(written(&out))
     }
 
-    #[tool(description = "Copy a file to another path, or to its own path as a new revision. Content is shared, not duplicated.")]
-    async fn drawer_copy(&self, Parameters(a): Parameters<CopyArg>, ctx: RequestContext<RoleServer>) -> Result<String, String> {
+    #[tool(
+        description = "Copy a file to another path, or to its own path as a new revision. Content is shared, not duplicated."
+    )]
+    async fn drawer_copy(
+        &self,
+        Parameters(a): Parameters<CopyArg>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
         let mut opts = WriteOpts::new(self.actor(a.author, &ctx), a.comment.unwrap_or_default());
         opts.if_head_revision = a.if_head_revision;
         let out = self
@@ -562,8 +738,14 @@ impl DrawerMcp {
         json(written(&out))
     }
 
-    #[tool(description = "Rename or move a file or folder. Keeps its id, history and sharing. Creates missing destination folders.")]
-    async fn drawer_move(&self, Parameters(a): Parameters<MoveArg>, ctx: RequestContext<RoleServer>) -> Result<String, String> {
+    #[tool(
+        description = "Rename or move a file or folder. Keeps its id, history and sharing. Creates missing destination folders."
+    )]
+    async fn drawer_move(
+        &self,
+        Parameters(a): Parameters<MoveArg>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
         let node = self
             .svc
             .move_to(Ref::Path(&a.from), &a.to, &self.actor(a.author, &ctx))
@@ -573,34 +755,85 @@ impl DrawerMcp {
     }
 
     #[tool(description = "Star or unstar a file or folder.")]
-    async fn drawer_star(&self, Parameters(a): Parameters<StarArg>, ctx: RequestContext<RoleServer>) -> Result<String, String> {
-        let node = self.svc.stat(Ref::Path(&a.path)).await.map_err(|e| e.to_string())?;
-        let u = NodeUpdate { starred: Some(a.starred), ..NodeUpdate::default() };
-        let node = self.svc.update(&node.id, u, &self.actor(a.author, &ctx)).await.map_err(|e| e.to_string())?;
+    async fn drawer_star(
+        &self,
+        Parameters(a): Parameters<StarArg>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
+        let node = self
+            .svc
+            .stat(Ref::Path(&a.path))
+            .await
+            .map_err(|e| e.to_string())?;
+        let u = NodeUpdate {
+            starred: Some(a.starred),
+            ..NodeUpdate::default()
+        };
+        let node = self
+            .svc
+            .update(&node.id, u, &self.actor(a.author, &ctx))
+            .await
+            .map_err(|e| e.to_string())?;
         json(serde_json::json!({ "path": node.path, "starred": node.starred }))
     }
 
-    #[tool(description = "List the top-most items in the trash, with the ids drawer_restore and drawer_purge take.")]
+    #[tool(
+        description = "List the top-most items in the trash, with the ids drawer_restore and drawer_purge take."
+    )]
     async fn drawer_trash(&self) -> Result<String, String> {
-        json(entries(&self.svc.trash_list().await.map_err(|e| e.to_string())?))
+        json(entries(
+            &self.svc.trash_list().await.map_err(|e| e.to_string())?,
+        ))
     }
 
-    #[tool(description = "Restore a trashed file or folder by id. Its parent folder must not be in the trash.")]
-    async fn drawer_restore(&self, Parameters(a): Parameters<IdArg>, ctx: RequestContext<RoleServer>) -> Result<String, String> {
-        let u = NodeUpdate { trashed: Some(false), ..NodeUpdate::default() };
-        let node = self.svc.update(&a.id, u, &self.actor(a.author, &ctx)).await.map_err(|e| e.to_string())?;
+    #[tool(
+        description = "Restore a trashed file or folder by id. Its parent folder must not be in the trash."
+    )]
+    async fn drawer_restore(
+        &self,
+        Parameters(a): Parameters<IdArg>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
+        let u = NodeUpdate {
+            trashed: Some(false),
+            ..NodeUpdate::default()
+        };
+        let node = self
+            .svc
+            .update(&a.id, u, &self.actor(a.author, &ctx))
+            .await
+            .map_err(|e| e.to_string())?;
         json(&entries(std::slice::from_ref(&node))[0])
     }
 
-    #[tool(description = "Permanently delete a trashed file or folder by id, with its history. This cannot be undone.")]
-    async fn drawer_purge(&self, Parameters(a): Parameters<IdArg>, ctx: RequestContext<RoleServer>) -> Result<String, String> {
-        self.svc.purge(&a.id, &self.actor(a.author, &ctx)).await.map_err(|e| e.to_string())?;
+    #[tool(
+        description = "Permanently delete a trashed file or folder by id, with its history. This cannot be undone."
+    )]
+    async fn drawer_purge(
+        &self,
+        Parameters(a): Parameters<IdArg>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
+        self.svc
+            .purge(&a.id, &self.actor(a.author, &ctx))
+            .await
+            .map_err(|e| e.to_string())?;
         Ok("deleted forever".into())
     }
 
-    #[tool(description = "Grant a principal a role (reader, writer or owner) on a file or folder. Applies to everything below it.")]
-    async fn drawer_share(&self, Parameters(a): Parameters<ShareArg>, ctx: RequestContext<RoleServer>) -> Result<String, String> {
-        let node = self.svc.stat(Ref::Path(&a.path)).await.map_err(|e| e.to_string())?;
+    #[tool(
+        description = "Grant a principal a role (reader, writer or owner) on a file or folder. Applies to everything below it."
+    )]
+    async fn drawer_share(
+        &self,
+        Parameters(a): Parameters<ShareArg>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
+        let node = self
+            .svc
+            .stat(Ref::Path(&a.path))
+            .await
+            .map_err(|e| e.to_string())?;
         json(
             self.svc
                 .share(&node.id, &a.principal, &a.role, &self.actor(a.author, &ctx))
@@ -610,8 +843,16 @@ impl DrawerMcp {
     }
 
     #[tool(description = "Remove a principal's grant on a file or folder.")]
-    async fn drawer_unshare(&self, Parameters(a): Parameters<UnshareArg>, ctx: RequestContext<RoleServer>) -> Result<String, String> {
-        let node = self.svc.stat(Ref::Path(&a.path)).await.map_err(|e| e.to_string())?;
+    async fn drawer_unshare(
+        &self,
+        Parameters(a): Parameters<UnshareArg>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
+        let node = self
+            .svc
+            .stat(Ref::Path(&a.path))
+            .await
+            .map_err(|e| e.to_string())?;
         json(
             self.svc
                 .unshare(&node.id, &a.principal, &self.actor(a.author, &ctx))
@@ -622,53 +863,116 @@ impl DrawerMcp {
 
     #[tool(description = "List starred files and folders.")]
     async fn drawer_starred(&self) -> Result<String, String> {
-        json(entries(&self.svc.starred().await.map_err(|e| e.to_string())?))
+        json(entries(
+            &self.svc.starred().await.map_err(|e| e.to_string())?,
+        ))
     }
 
-    #[tool(description = "List the most recently changed files across the whole drawer, newest first, with who changed them. Use it to catch up on what other agents or people did.")]
+    #[tool(
+        description = "List the most recently changed files across the whole drawer, newest first, with who changed them. Use it to catch up on what other agents or people did."
+    )]
     async fn drawer_recent(&self, Parameters(a): Parameters<RecentArg>) -> Result<String, String> {
         let limit = a.limit.unwrap_or(20).clamp(1, 200);
-        json(entries(&self.svc.recent(limit).await.map_err(|e| e.to_string())?))
+        json(entries(
+            &self.svc.recent(limit).await.map_err(|e| e.to_string())?,
+        ))
     }
 
-    #[tool(description = "Search live file names and text contents. Name matches come first; content matches include the line number and a snippet.")]
+    #[tool(
+        description = "Search live file names and text contents. Name matches come first; content matches include the line number and a snippet."
+    )]
     async fn drawer_search(&self, Parameters(a): Parameters<SearchArg>) -> Result<String, String> {
-        json(self.svc.search(&a.query, a.limit.unwrap_or(20)).await.map_err(|e| e.to_string())?)
+        json(
+            self.svc
+                .search(&a.query, a.limit.unwrap_or(20))
+                .await
+                .map_err(|e| e.to_string())?,
+        )
     }
 
-    #[tool(description = "Save a memory as a Markdown note in the /memory vault (Obsidian-style). Use [[Note Name]] to link related notes and #tags or the tags argument to categorise. An existing note with the same name is replaced, or extended with append=true. Prefer one note per topic and link them.")]
-    async fn memory_remember(&self, Parameters(a): Parameters<RememberArg>, ctx: RequestContext<RoleServer>) -> Result<String, String> {
+    #[tool(
+        description = "Save a memory as a Markdown note in the /memory vault (Obsidian-style). Use [[Note Name]] to link related notes and #tags or the tags argument to categorise. An existing note with the same name is replaced, or extended with append=true. Prefer one note per topic and link them."
+    )]
+    async fn memory_remember(
+        &self,
+        Parameters(a): Parameters<RememberArg>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
         let actor = self.actor(a.author, &ctx);
-        let out = crate::vault::save(&self.svc, &a.name, &a.content, &a.tags.unwrap_or_default(), a.append.unwrap_or(false), &actor)
-            .await
-            .map_err(|e| e.to_string())?;
+        let out = crate::vault::save(
+            &self.svc,
+            &a.name,
+            &a.content,
+            &a.tags.unwrap_or_default(),
+            a.append.unwrap_or(false),
+            &actor,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         json(out)
     }
 
-    #[tool(description = "Delete a memory note by name. It moves to the trash, so it can be restored with drawer_restore. Links to it stay in other notes as unresolved links.")]
-    async fn memory_forget(&self, Parameters(a): Parameters<NoteArg>, ctx: RequestContext<RoleServer>) -> Result<String, String> {
+    #[tool(
+        description = "Delete a memory note by name. It moves to the trash, so it can be restored with drawer_restore. Links to it stay in other notes as unresolved links."
+    )]
+    async fn memory_forget(
+        &self,
+        Parameters(a): Parameters<NoteArg>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
         let actor = self.actor(None, &ctx);
-        json(crate::vault::forget(&self.svc, &a.name, &actor).await.map_err(|e| e.to_string())?)
+        json(
+            crate::vault::forget(&self.svc, &a.name, &actor)
+                .await
+                .map_err(|e| e.to_string())?,
+        )
     }
 
-    #[tool(description = "Find memories by text and/or tag, newest first. Returns names, tags and a matching line. Call this before answering questions that earlier notes might cover; read a hit with memory_read.")]
+    #[tool(
+        description = "Find memories by text and/or tag, newest first. Returns names, tags and a matching line. Call this before answering questions that earlier notes might cover; read a hit with memory_read."
+    )]
     async fn memory_recall(&self, Parameters(a): Parameters<RecallArg>) -> Result<String, String> {
-        json(crate::vault::list(&self.svc, a.tag.as_deref(), a.query.as_deref(), a.limit.unwrap_or(20)).await.map_err(|e| e.to_string())?)
+        json(
+            crate::vault::list(
+                &self.svc,
+                a.tag.as_deref(),
+                a.query.as_deref(),
+                a.limit.unwrap_or(20),
+            )
+            .await
+            .map_err(|e| e.to_string())?,
+        )
     }
 
-    #[tool(description = "Read a memory note by name, with the notes it links to and the notes that link back to it (backlinks).")]
+    #[tool(
+        description = "Read a memory note by name, with the notes it links to and the notes that link back to it (backlinks)."
+    )]
     async fn memory_read(&self, Parameters(a): Parameters<NoteArg>) -> Result<String, String> {
-        json(crate::vault::get(&self.svc, &a.name).await.map_err(|e| e.to_string())?)
+        json(
+            crate::vault::get(&self.svc, &a.name)
+                .await
+                .map_err(|e| e.to_string())?,
+        )
     }
 
-    #[tool(description = "The memory link graph: every note as a node (with its tags and link counts) and every [[link]] as an edge. Notes linked to but not yet written appear as nodes without a path. Use it to see how memories relate and which topics are missing notes.")]
+    #[tool(
+        description = "The memory link graph: every note as a node (with its tags and link counts) and every [[link]] as an edge. Notes linked to but not yet written appear as nodes without a path. Use it to see how memories relate and which topics are missing notes."
+    )]
     async fn memory_graph(&self) -> Result<String, String> {
-        json(crate::vault::graph(&self.svc).await.map_err(|e| e.to_string())?)
+        json(
+            crate::vault::graph(&self.svc)
+                .await
+                .map_err(|e| e.to_string())?,
+        )
     }
 
     #[tool(description = "List every tag used in the memory vault with how many notes use it.")]
     async fn memory_tags(&self) -> Result<String, String> {
-        json(crate::vault::tags(&self.svc).await.map_err(|e| e.to_string())?)
+        json(
+            crate::vault::tags(&self.svc)
+                .await
+                .map_err(|e| e.to_string())?,
+        )
     }
 }
 
