@@ -13,8 +13,7 @@ class HashWorker {
   onerror: ((event: ErrorEvent) => void) | null = null;
   terminate() {}
   postMessage(file: Blob) {
-    const worker = this;
-    void hashFile(file).then((hash) => worker.onmessage?.({ data: { hash } } as MessageEvent));
+    void hashFile(file).then((hash) => this.onmessage?.({ data: { hash } } as MessageEvent));
   }
 }
 
@@ -72,7 +71,7 @@ test("pausing a batch keeps the progress bar and its Resume button on screen", a
 
   // The bug: the bar unmounted, so Resume never appeared even though `paused` was set.
   await waitFor(() => expect(screen.getByRole("button", { name: "Resume" })).toBeTruthy());
-  expect(screen.getByRole("button", { name: "Pause" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Pause" })).toBeNull();
   expect(screen.getByLabelText("Upload progress")).toBeTruthy();
   expect(screen.getByText(/Paused at/)).toBeTruthy();
 
