@@ -8,7 +8,7 @@ anyhow = "1.0.104"
 argon2 = "0.5.3"
 async_zip = { version = "0.0.18", features = ["tokio", "deflate"] }
 axum = "0.8.9"
-base64 = "0.22"
+base64 = "0.23"
 cap-std = "3.4.5"
 chrono = "0.4.45"
 clap = { version = "4.6.7", features = ["derive", "env"] }
