@@ -22,6 +22,7 @@ self.onmessage = (e: MessageEvent<{ data: ArrayBuffer | string; csv?: "," | "\t"
         : XLSX.read(new Uint8Array(data), { type: "array", dense: true, cellDates: true });
     const sheets: SheetData[] = book.SheetNames.map((name) => {
       const sheet = book.Sheets[name];
+      if (!sheet) return { name, rows: [], totalRows: 0, totalCols: 0 };
       const all = XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1, raw: false, defval: "", blankrows: true });
       const totalCols = all.reduce((m, r) => Math.max(m, r.length), 0);
       const rows = all.slice(0, MAX_ROWS).map((r) => r.slice(0, MAX_COLS).map((c) => (c == null ? "" : String(c))));

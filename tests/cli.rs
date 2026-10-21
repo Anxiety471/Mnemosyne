@@ -16,12 +16,20 @@ fn drawer(data: &Path, args: &[&str]) -> Output {
 }
 
 fn ok(out: Output) -> String {
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout).unwrap()
 }
 
 fn fail(out: Output) -> String {
-    assert!(!out.status.success(), "expected failure, got stdout: {}", String::from_utf8_lossy(&out.stdout));
+    assert!(
+        !out.status.success(),
+        "expected failure, got stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     String::from_utf8(out.stderr).unwrap()
 }
 
@@ -40,7 +48,10 @@ fn put_cat_and_ls_round_trip() {
 
     let out = ok(drawer(&data, &["put", file.to_str().unwrap(), "/notes/"]));
     assert_eq!(out.trim(), "/notes/todo.md saved as revision 1");
-    assert_eq!(ok(drawer(&data, &["cat", "/notes/todo.md"])), "# todo\n- ship it\n");
+    assert_eq!(
+        ok(drawer(&data, &["cat", "/notes/todo.md"])),
+        "# todo\n- ship it\n"
+    );
     assert_eq!(ok(drawer(&data, &["ls"])), "notes/\n");
     assert_eq!(ok(drawer(&data, &["ls", "/notes"])), "todo.md\n");
 }
@@ -61,11 +72,20 @@ fn put_if_revision_guards_against_a_stale_writer() {
     let data = tmp.path().join("store");
     let v1 = local(tmp.path(), "v1.txt", b"one");
     let v2 = local(tmp.path(), "v2.txt", b"two");
-    ok(drawer(&data, &["put", v1.to_str().unwrap(), "/a.txt", "--if-revision", "0"]));
+    ok(drawer(
+        &data,
+        &["put", v1.to_str().unwrap(), "/a.txt", "--if-revision", "0"],
+    ));
     // Creating again with --if-revision 0 must refuse, since the file exists.
-    let err = fail(drawer(&data, &["put", v2.to_str().unwrap(), "/a.txt", "--if-revision", "0"]));
+    let err = fail(drawer(
+        &data,
+        &["put", v2.to_str().unwrap(), "/a.txt", "--if-revision", "0"],
+    ));
     assert!(err.contains("precondition"), "{err}");
-    let out = ok(drawer(&data, &["put", v2.to_str().unwrap(), "/a.txt", "--if-revision", "1"]));
+    let out = ok(drawer(
+        &data,
+        &["put", v2.to_str().unwrap(), "/a.txt", "--if-revision", "1"],
+    ));
     assert!(out.contains("revision 2"), "{out}");
 }
 
@@ -82,7 +102,12 @@ fn put_reads_stdin_and_records_properties() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(b"piped body").unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"piped body")
+        .unwrap();
     ok(child.wait_with_output().unwrap());
 
     assert_eq!(ok(drawer(&data, &["cat", "/from-stdin.txt"])), "piped body");
@@ -151,7 +176,10 @@ fn history_and_rollback_keep_every_revision() {
     let out = ok(drawer(&data, &["rollback", "/rev.txt", "1"]));
     assert!(out.contains("revision 4"), "{out}");
     assert_eq!(ok(drawer(&data, &["cat", "/rev.txt"])), "one");
-    assert_eq!(ok(drawer(&data, &["cat", "/rev.txt", "--revision", "2"])), "two");
+    assert_eq!(
+        ok(drawer(&data, &["cat", "/rev.txt", "--revision", "2"])),
+        "two"
+    );
 }
 
 #[test]
@@ -200,9 +228,15 @@ fn get_refuses_to_overwrite_without_force() {
     let f = local(tmp.path(), "keep.txt", b"new");
     ok(drawer(&data, &["put", f.to_str().unwrap(), "/keep.txt"]));
     let target = local(tmp.path(), "out.txt", b"mine");
-    let err = fail(drawer(&data, &["get", "/keep.txt", target.to_str().unwrap()]));
+    let err = fail(drawer(
+        &data,
+        &["get", "/keep.txt", target.to_str().unwrap()],
+    ));
     assert!(err.contains("--force"), "{err}");
-    ok(drawer(&data, &["get", "/keep.txt", target.to_str().unwrap(), "--force"]));
+    ok(drawer(
+        &data,
+        &["get", "/keep.txt", target.to_str().unwrap(), "--force"],
+    ));
     assert_eq!(std::fs::read(&target).unwrap(), b"new");
 }
 
@@ -272,7 +306,10 @@ fn mcp_config_points_at_this_binary_and_an_absolute_store() {
         .unwrap());
     assert!(out.contains("mcp_servers:"), "{out}");
     assert!(out.contains("command: \""), "{out}");
-    assert!(out.contains("\"--data-dir\", \"/"), "store path should be absolute: {out}");
+    assert!(
+        out.contains("\"--data-dir\", \"/"),
+        "store path should be absolute: {out}"
+    );
     assert!(out.contains("\"stdio\"]"), "{out}");
 
     let json = ok(Command::new(env!("CARGO_BIN_EXE_drawer"))
@@ -288,7 +325,10 @@ fn mcp_config_points_at_this_binary_and_an_absolute_store() {
 
 #[test]
 fn version_flag_prints_the_crate_version() {
-    let out = ok(Command::new(env!("CARGO_BIN_EXE_drawer")).arg("--version").output().unwrap());
+    let out = ok(Command::new(env!("CARGO_BIN_EXE_drawer"))
+        .arg("--version")
+        .output()
+        .unwrap());
     assert!(out.starts_with("drawer 0.1.3"), "{out}");
 }
 
@@ -300,9 +340,24 @@ fn edit_diff_tree_and_recent() {
     ok(drawer(&data, &["put", file.to_str().unwrap(), "/work/"]));
     ok(drawer(&data, &["mkdir", "/work/empty"]));
 
-    let out = ok(drawer(&data, &["edit", "/work/plan.md", "--old", "two", "--new", "2", "-c", "shorter"]));
+    let out = ok(drawer(
+        &data,
+        &[
+            "edit",
+            "/work/plan.md",
+            "--old",
+            "two",
+            "--new",
+            "2",
+            "-c",
+            "shorter",
+        ],
+    ));
     assert!(out.contains("revision 2"), "{out}");
-    let err = fail(drawer(&data, &["edit", "/work/plan.md", "--old", "step", "--new", "x"]));
+    let err = fail(drawer(
+        &data,
+        &["edit", "/work/plan.md", "--old", "step", "--new", "x"],
+    ));
     assert!(err.contains("2 times"), "{err}");
 
     let diff = ok(drawer(&data, &["diff", "/work/plan.md"]));
@@ -310,27 +365,60 @@ fn edit_diff_tree_and_recent() {
 
     let tree = ok(drawer(&data, &["tree"]));
     assert!(tree.contains("└── work/"), "{tree}");
-    assert!(tree.contains("├── empty/") && tree.contains("└── plan.md"), "{tree}");
+    assert!(
+        tree.contains("├── empty/") && tree.contains("└── plan.md"),
+        "{tree}"
+    );
     assert!(tree.contains("2 folders, 1 file"), "{tree}");
 
     let recent = ok(drawer(&data, &["recent"]));
-    assert!(recent.contains("tester") && recent.contains("/work/plan.md"), "{recent}");
+    assert!(
+        recent.contains("tester") && recent.contains("/work/plan.md"),
+        "{recent}"
+    );
 }
 
 #[test]
 fn mcp_config_covers_each_harness_and_http() {
-    let run = |args: &[&str]| ok(Command::new(env!("CARGO_BIN_EXE_drawer")).args(args).output().unwrap());
+    let run = |args: &[&str]| {
+        ok(Command::new(env!("CARGO_BIN_EXE_drawer"))
+            .args(args)
+            .output()
+            .unwrap())
+    };
     assert!(run(&["mcp-config", "--format", "claude-code"]).starts_with("claude mcp add"));
     let codex = run(&["mcp-config", "--format", "codex", "--url", "http://h:1/mcp"]);
-    assert!(codex.contains("[mcp_servers.drawer]") && codex.contains("url = \"http://h:1/mcp\""), "{codex}");
-    let gemini: serde_json::Value =
-        serde_json::from_str(&run(&["mcp-config", "--format", "gemini", "--url", "http://h:1/mcp"])).unwrap();
+    assert!(
+        codex.contains("[mcp_servers.drawer]") && codex.contains("url = \"http://h:1/mcp\""),
+        "{codex}"
+    );
+    let gemini: serde_json::Value = serde_json::from_str(&run(&[
+        "mcp-config",
+        "--format",
+        "gemini",
+        "--url",
+        "http://h:1/mcp",
+    ]))
+    .unwrap();
     assert_eq!(gemini["mcpServers"]["drawer"]["httpUrl"], "http://h:1/mcp");
-    let vscode: serde_json::Value = serde_json::from_str(&run(&["mcp-config", "--format", "vscode", "--name", "files"])).unwrap();
+    let vscode: serde_json::Value = serde_json::from_str(&run(&[
+        "mcp-config",
+        "--format",
+        "vscode",
+        "--name",
+        "files",
+    ]))
+    .unwrap();
     assert_eq!(vscode["servers"]["files"]["type"], "stdio");
-    let opencode: serde_json::Value = serde_json::from_str(&run(&["mcp-config", "--format", "opencode"])).unwrap();
+    let opencode: serde_json::Value =
+        serde_json::from_str(&run(&["mcp-config", "--format", "opencode"])).unwrap();
     assert_eq!(opencode["mcp"]["drawer"]["type"], "local");
-    let err = fail(Command::new(env!("CARGO_BIN_EXE_drawer")).args(["mcp-config", "--name", "a b"]).output().unwrap());
+    let err = fail(
+        Command::new(env!("CARGO_BIN_EXE_drawer"))
+            .args(["mcp-config", "--name", "a b"])
+            .output()
+            .unwrap(),
+    );
     assert!(err.contains("--name"), "{err}");
     assert!(run(&["completions", "bash"]).contains("_drawer"));
 }
@@ -355,9 +443,13 @@ fn update_check_reports_an_unreachable_release_host_without_touching_the_store()
 /// Isolate home and working directory without changing this test process's environment.
 fn standalone(home: &Path, cwd: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_drawer"));
-    command.env("HOME", home).env("USERPROFILE", home)
-        .env_remove("DRAWER_DATA_DIR").current_dir(cwd)
-        .args(["--author", "tester"]).args(args);
+    command
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env_remove("DRAWER_DATA_DIR")
+        .current_dir(cwd)
+        .args(["--author", "tester"])
+        .args(args);
     command
 }
 
@@ -373,11 +465,23 @@ fn default_store_is_shared_across_working_directories() {
     std::fs::create_dir(first.join("data")).unwrap();
     std::fs::write(first.join("data/keep.txt"), "legacy data").unwrap();
     let file = local(tmp.path(), "note.txt", b"same home store\n");
-    ok(standalone(&home, &first, &["put", file.to_str().unwrap(), "/note.txt"]).output().unwrap());
-    assert_eq!(ok(standalone(&home, &second, &["cat", "/note.txt"]).output().unwrap()), "same home store\n");
+    ok(
+        standalone(&home, &first, &["put", file.to_str().unwrap(), "/note.txt"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        ok(standalone(&home, &second, &["cat", "/note.txt"])
+            .output()
+            .unwrap()),
+        "same home store\n"
+    );
     assert!(home.join(".drawer/drawer.db").is_file());
     assert!(home.join(".drawer/blobs").is_dir());
-    assert_eq!(std::fs::read_to_string(first.join("data/keep.txt")).unwrap(), "legacy data");
+    assert_eq!(
+        std::fs::read_to_string(first.join("data/keep.txt")).unwrap(),
+        "legacy data"
+    );
     assert!(!first.join("data/drawer.db").exists());
     assert!(!first.join(".drawer").exists());
     assert!(!second.join("data").exists());
@@ -391,9 +495,17 @@ fn explicit_store_overrides_environment_and_home_default() {
     let from_env = tmp.path().join("env-store");
     let from_flag = tmp.path().join("flag-store");
     ok(standalone(&home, tmp.path(), &["mkdir", "/environment"])
-        .env("DRAWER_DATA_DIR", &from_env).output().unwrap());
-    ok(standalone(&home, tmp.path(), &["--data-dir", from_flag.to_str().unwrap(), "mkdir", "/flag"])
-        .env("DRAWER_DATA_DIR", &from_env).output().unwrap());
+        .env("DRAWER_DATA_DIR", &from_env)
+        .output()
+        .unwrap());
+    ok(standalone(
+        &home,
+        tmp.path(),
+        &["--data-dir", from_flag.to_str().unwrap(), "mkdir", "/flag"],
+    )
+    .env("DRAWER_DATA_DIR", &from_env)
+    .output()
+    .unwrap());
     assert!(from_env.join("drawer.db").is_file());
     assert!(from_flag.join("drawer.db").is_file());
     assert_eq!(ok(drawer(&from_env, &["ls"])), "environment/\n");
@@ -405,7 +517,11 @@ fn explicit_store_overrides_environment_and_home_default() {
 fn mcp_config_uses_home_store_without_creating_it() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
-    let config = ok(standalone(&home, tmp.path(), &["mcp-config", "--format", "json"]).output().unwrap());
+    let config = ok(
+        standalone(&home, tmp.path(), &["mcp-config", "--format", "json"])
+            .output()
+            .unwrap(),
+    );
     let value: serde_json::Value = serde_json::from_str(&config).unwrap();
     let args = &value["mcpServers"]["drawer"]["args"];
     assert_eq!(args[0], "--data-dir");
@@ -420,7 +536,10 @@ fn reading_missing_default_store_does_not_create_it() {
     let home = tmp.path().join("home");
     let error = fail(standalone(&home, tmp.path(), &["ls"]).output().unwrap());
     assert!(error.contains("no store at"), "{error}");
-    assert!(error.contains(&home.join(".drawer").display().to_string()), "{error}");
+    assert!(
+        error.contains(&home.join(".drawer").display().to_string()),
+        "{error}"
+    );
     assert!(!home.exists());
 }
 
@@ -437,7 +556,11 @@ fn missing_home_requires_explicit_store_but_not_help_or_completions() {
     ok(without_home(&["--help"]).output().unwrap());
     ok(without_home(&["completions", "bash"]).output().unwrap());
     let store = tmp.path().join("explicit-store");
-    ok(without_home(&["--data-dir", store.to_str().unwrap(), "mkdir", "/works"]).output().unwrap());
+    ok(
+        without_home(&["--data-dir", store.to_str().unwrap(), "mkdir", "/works"])
+            .output()
+            .unwrap(),
+    );
     assert!(store.join("drawer.db").is_file());
     assert!(!tmp.path().join(".drawer").exists());
 }
@@ -446,33 +569,62 @@ fn missing_home_requires_explicit_store_but_not_help_or_completions() {
 fn userprofile_is_used_when_home_is_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("profile");
-    ok(standalone(&home, tmp.path(), &["mkdir", "/works"]).env("HOME", "").output().unwrap());
+    ok(standalone(&home, tmp.path(), &["mkdir", "/works"])
+        .env("HOME", "")
+        .output()
+        .unwrap());
     assert!(home.join(".drawer/drawer.db").is_file());
     assert!(!tmp.path().join(".drawer").exists());
 }
 
 #[test]
 fn service_install_writes_unit_without_starting_or_creating_store() {
-    if !cfg!(target_os = "linux") { return; }
+    if !cfg!(target_os = "linux") {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
-    ok(standalone(&home, tmp.path(), &["service", "install", "--no-start"]).output().unwrap());
+    ok(
+        standalone(&home, tmp.path(), &["service", "install", "--no-start"])
+            .output()
+            .unwrap(),
+    );
     let unit = std::fs::read_to_string(home.join(".config/systemd/user/drawer.service")).unwrap();
     assert!(unit.contains(home.join(".drawer").to_str().unwrap()));
     assert!(!home.join(".drawer").exists());
-    fail(standalone(&home, tmp.path(), &["service", "install", "--no-start"]).output().unwrap());
+    fail(
+        standalone(&home, tmp.path(), &["service", "install", "--no-start"])
+            .output()
+            .unwrap(),
+    );
 }
 
 #[test]
 fn backup_schedule_can_be_inspected_without_starting_systemd() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_drawer")).env("HOME",dir.path()).args(["--data-dir",dir.path().join("store").to_str().unwrap(),"backup","schedule","--directory",dir.path().join("backups").to_str().unwrap(),"--no-start"]).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_drawer"))
+        .env("HOME", dir.path())
+        .args([
+            "--data-dir",
+            dir.path().join("store").to_str().unwrap(),
+            "backup",
+            "schedule",
+            "--directory",
+            dir.path().join("backups").to_str().unwrap(),
+            "--no-start",
+        ])
+        .output()
+        .unwrap();
     ok(out);
     let units = dir.path().join(".config/systemd/user");
     let service = std::fs::read_to_string(units.join("drawer-backup.service")).unwrap();
     assert!(service.contains("backup scheduled --directory"));
     assert!(service.contains("UMask=0077"));
-    assert!(std::fs::read_to_string(units.join("drawer-backup.timer")).unwrap().contains("OnCalendar=daily"));
+    assert!(
+        std::fs::read_to_string(units.join("drawer-backup.timer"))
+            .unwrap()
+            .contains("OnCalendar=daily")
+    );
     assert!(!dir.path().join("store").exists());
 }
 
@@ -481,15 +633,39 @@ fn memory_commands_save_recall_and_read() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path();
     // `memory remember` starts the store, like `put`.
-    assert!(ok(drawer(data, &["memory", "remember", "Drawer", "A file server #infra", "-t", "project"])).starts_with("saved /memory/Drawer.md"));
-    ok(drawer(data, &["memory", "remember", "people/Alice", "Runs [[Drawer]]"]));
-    assert!(ok(drawer(data, &["memory", "recall", "file server"])).contains("Drawer #project #infra"));
+    assert!(
+        ok(drawer(
+            data,
+            &[
+                "memory",
+                "remember",
+                "Drawer",
+                "A file server #infra",
+                "-t",
+                "project"
+            ]
+        ))
+        .starts_with("saved /memory/Drawer.md")
+    );
+    ok(drawer(
+        data,
+        &["memory", "remember", "people/Alice", "Runs [[Drawer]]"],
+    ));
+    assert!(
+        ok(drawer(data, &["memory", "recall", "file server"])).contains("Drawer #project #infra")
+    );
     assert!(ok(drawer(data, &["memory", "recall", "-t", "project"])).contains("Drawer"));
     assert!(ok(drawer(data, &["memory", "read", "drawer"])).contains("backlinks: [[Alice]]"));
     assert!(ok(drawer(data, &["memory", "tags"])).contains("#infra  1"));
     let graph = ok(drawer(data, &["memory", "graph"]));
-    assert!(graph.contains("Alice\n  -> Drawer") && graph.contains("Drawer\n  <- Alice"), "{graph}");
+    assert!(
+        graph.contains("Alice\n  -> Drawer") && graph.contains("Drawer\n  <- Alice"),
+        "{graph}"
+    );
     assert!(fail(drawer(data, &["memory", "read", "nope"])).contains("not found"));
-    assert!(ok(drawer(data, &["memory", "forget", "Alice"])).starts_with("trashed /memory/people/Alice.md"));
+    assert!(
+        ok(drawer(data, &["memory", "forget", "Alice"]))
+            .starts_with("trashed /memory/people/Alice.md")
+    );
     assert!(fail(drawer(data, &["memory", "read", "Alice"])).contains("not found"));
 }

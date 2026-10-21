@@ -156,18 +156,27 @@ pub fn uninstall(data_dir: Option<&Path>) -> Result<()> {
     let exe = std::env::current_exe()
         .and_then(|p| p.canonicalize())
         .context("cannot find the running drawer binary")?;
-    let home = std::env::var_os("HOME").map(PathBuf::from).filter(|p| p.is_absolute());
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute());
     let unit = home
         .as_ref()
         .map(|h| h.join(".config/systemd/user/drawer.service"))
         .filter(|u| cfg!(target_os = "linux") && u.is_file());
     if let Some(unit) = unit {
-        let _ = Command::new("systemctl").args(["--user", "disable", "--now", "drawer.service"]).status();
+        let _ = Command::new("systemctl")
+            .args(["--user", "disable", "--now", "drawer.service"])
+            .status();
         fs::remove_file(&unit).with_context(|| format!("cannot remove {}", unit.display()))?;
-        let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).status();
+        let _ = Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
         println!("removed service {}", unit.display());
     }
-    let share = exe.parent().and_then(Path::parent).map(|p| p.join("share/drawer"));
+    let share = exe
+        .parent()
+        .and_then(Path::parent)
+        .map(|p| p.join("share/drawer"));
     if let Some(share) = share.filter(|s| s.join("ui").is_dir()) {
         fs::remove_dir_all(share.join("ui")).context("cannot remove the web UI")?;
         let _ = fs::remove_dir(&share); // only if empty
@@ -176,7 +185,10 @@ pub fn uninstall(data_dir: Option<&Path>) -> Result<()> {
     fs::remove_file(&exe).with_context(|| format!("cannot remove {}", exe.display()))?;
     println!("removed {}", exe.display());
     if let Some(dir) = data_dir {
-        println!("your data was left in place at {}; delete it yourself if you no longer want it", dir.display());
+        println!(
+            "your data was left in place at {}; delete it yourself if you no longer want it",
+            dir.display()
+        );
     }
     Ok(())
 }
@@ -209,8 +221,10 @@ fn fetch(url: &str, dest: &Path) -> Result<bool> {
     let out = Command::new("curl")
         .args([
             "-sSL",
-            "--connect-timeout", "15",
-            "--max-time", "600",
+            "--connect-timeout",
+            "15",
+            "--max-time",
+            "600",
             "-H",
             "Accept: application/vnd.github+json",
             "-H",
@@ -256,12 +270,21 @@ fn verify(archive: &Path, name: &str, sums: &str) -> Result<()> {
 /// rename succeeds, and restore it if the final commit fails. Unique sibling paths avoid
 /// deleting unrelated ui.new/ui.old directories left by an operator or another process.
 fn replace_install(bundle: &Path, exe: &Path) -> Result<()> {
-    let dir = exe.parent().ok_or_else(|| anyhow!("binary has no parent directory"))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| anyhow!("binary has no parent directory"))?;
     let id = uuid::Uuid::new_v4();
     let binary = dir.join(format!(".drawer-update-{id}"));
-    let ui = dir.parent().map(|p| p.join("share/drawer/ui")).filter(|p| p.is_dir());
-    let staged_ui = ui.as_ref().map(|p| p.with_file_name(format!(".ui-new-{id}")));
-    let old_ui = ui.as_ref().map(|p| p.with_file_name(format!(".ui-old-{id}")));
+    let ui = dir
+        .parent()
+        .map(|p| p.join("share/drawer/ui"))
+        .filter(|p| p.is_dir());
+    let staged_ui = ui
+        .as_ref()
+        .map(|p| p.with_file_name(format!(".ui-new-{id}")));
+    let old_ui = ui
+        .as_ref()
+        .map(|p| p.with_file_name(format!(".ui-old-{id}")));
     let result = (|| -> Result<()> {
         fs::copy(bundle.join("drawer"), &binary).context("cannot stage the new binary")?;
         if let (Some(ui), Some(staged), Some(old)) = (&ui, &staged_ui, &old_ui) {
@@ -277,16 +300,21 @@ fn replace_install(bundle: &Path, exe: &Path) -> Result<()> {
         }
         if let Err(err) = fs::rename(&binary, exe) {
             if let (Some(ui), Some(old)) = (&ui, &old_ui) {
-                fs::remove_dir_all(ui).context("cannot remove the staged web UI during rollback")?;
+                fs::remove_dir_all(ui)
+                    .context("cannot remove the staged web UI during rollback")?;
                 fs::rename(old, ui).context("cannot restore the old web UI")?;
             }
             return Err(err).context("cannot replace the binary");
         }
-        if let Some(old) = &old_ui { let _ = fs::remove_dir_all(old); }
+        if let Some(old) = &old_ui {
+            let _ = fs::remove_dir_all(old);
+        }
         Ok(())
     })();
     let _ = fs::remove_file(&binary);
-    if let Some(staged) = staged_ui { let _ = fs::remove_dir_all(staged); }
+    if let Some(staged) = staged_ui {
+        let _ = fs::remove_dir_all(staged);
+    }
     result
 }
 

@@ -110,6 +110,13 @@ CREATE TABLE IF NOT EXISTS upload_links (
     files_uploaded INTEGER NOT NULL DEFAULT 0, bytes_uploaded INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS deposit_chunks (
+    id TEXT PRIMARY KEY, link_id TEXT NOT NULL REFERENCES upload_links(id) ON DELETE CASCADE,
+    name TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL,
+    filename TEXT NOT NULL, received INTEGER NOT NULL DEFAULT 0,
+    expires_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS user_accounts (
     id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
     quota_bytes INTEGER NOT NULL CHECK(quota_bytes>0), disabled INTEGER NOT NULL DEFAULT 0

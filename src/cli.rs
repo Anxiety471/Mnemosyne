@@ -81,15 +81,24 @@ pub enum Cmd {
     /// Speak MCP over stdin and stdout, for clients that start drawer as a subprocess.
     Stdio,
     /// Install or manage the Linux user background service.
-    Service { #[command(subcommand)] action: crate::background::ServiceAction },
+    Service {
+        #[command(subcommand)]
+        action: crate::background::ServiceAction,
+    },
     /// Synchronize a local desktop folder with a remote Drawer workspace.
     Sync(crate::sync::SyncArgs),
     /// Preview or apply offline retention and orphan-blob cleanup.
     Cleanup(crate::cleanup::CleanupArgs),
     /// Create, verify, restore and schedule offline snapshots.
-    Backup { #[command(subcommand)] action: crate::backup::BackupAction },
+    Backup {
+        #[command(subcommand)]
+        action: crate::backup::BackupAction,
+    },
     /// Register and manage read-only host folder mounts.
-    Mount { #[command(subcommand)] action: crate::mounts::MountAction },
+    Mount {
+        #[command(subcommand)]
+        action: crate::mounts::MountAction,
+    },
     /// List a folder. Folders are shown with a trailing slash.
     Ls {
         #[arg(default_value = "/")]
@@ -191,7 +200,10 @@ pub enum Cmd {
         limit: usize,
     },
     /// Read and write the AI memory vault (Markdown notes in /memory).
-    Memory { #[command(subcommand)] action: MemoryAction },
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
     /// Star a file or folder.
     Star { path: String },
     /// Remove a star.
@@ -344,27 +356,50 @@ async fn dispatch(cli: Cli) -> Result<()> {
         clap_complete::generate(*shell, &mut command, "drawer", &mut std::io::stdout());
         return Ok(());
     }
-    if let Cmd::Sync(args) = &cmd { return crate::sync::run(args).await; }
+    if let Cmd::Sync(args) = &cmd {
+        return crate::sync::run(args).await;
+    }
     // Resolve only for commands that use a store. Help, completions and self-update
     // must also work in minimal environments without a home directory.
     let data_dir = match cli.data_dir {
         Some(path) => path,
         None => default_data_dir()?,
     };
-    if let Cmd::Service { action } = &cmd { return crate::background::run(action, &data_dir); }
-    if let Cmd::Backup { action } = &cmd { return crate::backup::cli(action, &data_dir).await; }
-    if let Cmd::Cleanup(args) = &cmd { println!("{}",serde_json::to_string_pretty(&crate::cleanup::cleanup(&data_dir,args).await?)?); return Ok(()); }
+    if let Cmd::Service { action } = &cmd {
+        return crate::background::run(action, &data_dir);
+    }
+    if let Cmd::Backup { action } = &cmd {
+        return crate::backup::cli(action, &data_dir).await;
+    }
+    if let Cmd::Cleanup(args) = &cmd {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&crate::cleanup::cleanup(&data_dir, args).await?)?
+        );
+        return Ok(());
+    }
     if let Cmd::McpConfig { format, url, name } = &cmd {
         print!("{}", mcp_config(*format, &data_dir, url.as_deref(), name)?);
         return Ok(());
     }
     if matches!(cmd, Cmd::Serve(_) | Cmd::Stdio) {
         // Logs go to stderr so stdio MCP keeps stdout clean.
-        tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .init();
     }
     // Only these start a store. Everything else needs one already there, so a typo in
     // --data-dir fails loudly instead of quietly creating an empty store.
-    let creates = matches!(cmd, Cmd::Serve(_) | Cmd::Stdio | Cmd::Put(_) | Cmd::Mkdir { .. } | Cmd::Memory { action: MemoryAction::Remember { .. } });
+    let creates = matches!(
+        cmd,
+        Cmd::Serve(_)
+            | Cmd::Stdio
+            | Cmd::Put(_)
+            | Cmd::Mkdir { .. }
+            | Cmd::Memory {
+                action: MemoryAction::Remember { .. }
+            }
+    );
     if !creates && !data_dir.join(DB_FILE).exists() {
         bail!(
             "no store at {}; set --data-dir or DRAWER_DATA_DIR, or start one with `drawer serve` or `drawer put`",
@@ -382,7 +417,10 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Cmd::Serve(args) => serve(svc, &data_dir, args).await,
         Cmd::Stdio => {
             use rmcp::ServiceExt;
-            let running = crate::mcp::DrawerMcp::new(svc).with_author(mcp_author).serve(rmcp::transport::stdio()).await?;
+            let running = crate::mcp::DrawerMcp::new(svc)
+                .with_author(mcp_author)
+                .serve(rmcp::transport::stdio())
+                .await?;
             running.waiting().await?;
             Ok(())
         }
@@ -415,14 +453,24 @@ async fn dispatch(cli: Cli) -> Result<()> {
             println!("{}", crate::service::normalize(&path)?);
             print_tree(&nodes, &crate::service::normalize(&path)?);
             let files = nodes.iter().filter(|n| n.kind == "file").count();
-            let count = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+            let count =
+                |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
             let cut = if truncated { " (cut short)" } else { "" };
-            println!("\n{}, {}{cut}", count(nodes.len() - files, "folder"), count(files, "file"));
+            println!(
+                "\n{}, {}{cut}",
+                count(nodes.len() - files, "folder"),
+                count(files, "file")
+            );
             Ok(())
         }
         Cmd::Mkdir { path } => {
             let node = svc.mkdir(&path, &actor).await?;
-            if json { emit_json(&node) } else { println!("{}", node.path); Ok(()) }
+            if json {
+                emit_json(&node)
+            } else {
+                println!("{}", node.path);
+                Ok(())
+            }
         }
         Cmd::Put(args) => {
             let (dest, data) = if args.file == Path::new("-") {
@@ -433,7 +481,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     .filter(|d| !d.ends_with('/'))
                     .ok_or_else(|| anyhow!("uploading from stdin needs a destination file path, like /notes/todo.md"))?;
                 let mut buf = Vec::new();
-                std::io::stdin().read_to_end(&mut buf).context("reading stdin")?;
+                std::io::stdin()
+                    .read_to_end(&mut buf)
+                    .context("reading stdin")?;
                 (dest, buf)
             } else {
                 let name = args
@@ -442,7 +492,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     .and_then(|n| n.to_str())
                     .ok_or_else(|| anyhow!("{} has no usable file name", args.file.display()))?;
                 let dest = target_path(&svc, args.dest.as_deref().unwrap_or("/"), name).await?;
-                let data = tokio::fs::read(&args.file).await.with_context(|| format!("reading {}", args.file.display()))?;
+                let data = tokio::fs::read(&args.file)
+                    .await
+                    .with_context(|| format!("reading {}", args.file.display()))?;
                 (dest, data)
             };
             let opts = write_opts(&actor, &args.comment, args.props, args.if_revision);
@@ -461,12 +513,25 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     std::io::stdout().write_all(&data)?;
                 }
                 other => {
-                    let out = other.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(leaf(&args.path)));
+                    let out = other
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| PathBuf::from(leaf(&args.path)));
                     if out.exists() && !args.force {
-                        bail!("{} already exists; pass --force to overwrite it", out.display());
+                        bail!(
+                            "{} already exists; pass --force to overwrite it",
+                            out.display()
+                        );
                     }
-                    tokio::fs::write(&out, &data).await.with_context(|| format!("writing {}", out.display()))?;
-                    println!("saved {} (revision {}, {}) to {}", args.path, rev.revision, human_size(data.len() as i64), out.display());
+                    tokio::fs::write(&out, &data)
+                        .await
+                        .with_context(|| format!("writing {}", out.display()))?;
+                    println!(
+                        "saved {} (revision {}, {}) to {}",
+                        args.path,
+                        rev.revision,
+                        human_size(data.len() as i64),
+                        out.display()
+                    );
                 }
             }
             Ok(())
@@ -481,7 +546,12 @@ async fn dispatch(cli: Cli) -> Result<()> {
         }
         Cmd::Rm { path } => {
             let node = svc.trash(Ref::Path(&path), None, &actor).await?;
-            if json { emit_json(&node) } else { println!("trashed {} (id {})", node.path, node.id); Ok(()) }
+            if json {
+                emit_json(&node)
+            } else {
+                println!("trashed {} (id {})", node.path, node.id);
+                Ok(())
+            }
         }
         Cmd::Trash => {
             let nodes = svc.trash_list().await?;
@@ -497,8 +567,22 @@ async fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Restore { id } => {
-            let node = svc.update(&id, NodeUpdate { trashed: Some(false), ..NodeUpdate::default() }, &actor).await?;
-            if json { emit_json(&node) } else { println!("restored {}", node.path); Ok(()) }
+            let node = svc
+                .update(
+                    &id,
+                    NodeUpdate {
+                        trashed: Some(false),
+                        ..NodeUpdate::default()
+                    },
+                    &actor,
+                )
+                .await?;
+            if json {
+                emit_json(&node)
+            } else {
+                println!("restored {}", node.path);
+                Ok(())
+            }
         }
         Cmd::Purge { id, yes } => {
             if !yes {
@@ -512,11 +596,23 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Cmd::Mv { from, to } => {
             let dest = target_path(&svc, &to, leaf(&from)).await?;
             let node = svc.move_to(Ref::Path(&from), &dest, &actor).await?;
-            if json { emit_json(&node) } else { println!("{from} -> {}", node.path); Ok(()) }
+            if json {
+                emit_json(&node)
+            } else {
+                println!("{from} -> {}", node.path);
+                Ok(())
+            }
         }
         Cmd::Cp { from, to, revision } => {
             let dest = target_path(&svc, &to, leaf(&from)).await?;
-            let out = svc.copy(Ref::Path(&from), &dest, revision, write_opts(&actor, "", Vec::new(), None)).await?;
+            let out = svc
+                .copy(
+                    Ref::Path(&from),
+                    &dest,
+                    revision,
+                    write_opts(&actor, "", Vec::new(), None),
+                )
+                .await?;
             report_write(&out, json)
         }
         Cmd::History { path } => {
@@ -524,7 +620,10 @@ async fn dispatch(cli: Cli) -> Result<()> {
             if json {
                 return emit_json(&revs);
             }
-            println!("{:>4}  {:<16}  {:<12} {:>9}  COMMENT", "REV", "WHEN", "AUTHOR", "SIZE");
+            println!(
+                "{:>4}  {:<16}  {:<12} {:>9}  COMMENT",
+                "REV", "WHEN", "AUTHOR", "SIZE"
+            );
             for r in &revs {
                 println!(
                     "{:>4}  {:<16}  {:<12} {:>9}  {}",
@@ -537,21 +636,41 @@ async fn dispatch(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Diff { path, from, to, context } => {
+        Cmd::Diff {
+            path,
+            from,
+            to,
+            context,
+        } => {
             let d = svc.diff(Ref::Path(&path), from, to, context).await?;
             if json {
                 return emit_json(&d);
             }
             if d.diff.is_empty() {
-                println!("{} revisions {} and {} have the same content", d.path, d.from, d.to);
+                println!(
+                    "{} revisions {} and {} have the same content",
+                    d.path, d.from, d.to
+                );
             } else {
                 print_diff(&d.diff);
             }
             Ok(())
         }
-        Cmd::Edit { path, old, new, all, comment } => {
-            let e = Edit { old, new, replace_all: all };
-            let out = svc.edit(&path, &[e], write_opts(&actor, &comment, Vec::new(), None)).await?;
+        Cmd::Edit {
+            path,
+            old,
+            new,
+            all,
+            comment,
+        } => {
+            let e = Edit {
+                old,
+                new,
+                replace_all: all,
+            };
+            let out = svc
+                .edit(&path, &[e], write_opts(&actor, &comment, Vec::new(), None))
+                .await?;
             report_write(&out, json)
         }
         Cmd::Recent { limit } => {
@@ -570,8 +689,18 @@ async fn dispatch(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Rollback { path, revision, comment } => {
-            let out = svc.rollback(Ref::Path(&path), revision, write_opts(&actor, &comment, Vec::new(), None)).await?;
+        Cmd::Rollback {
+            path,
+            revision,
+            comment,
+        } => {
+            let out = svc
+                .rollback(
+                    Ref::Path(&path),
+                    revision,
+                    write_opts(&actor, &comment, Vec::new(), None),
+                )
+                .await?;
             report_write(&out, json)
         }
         Cmd::Search { query, limit } => {
@@ -620,18 +749,39 @@ async fn dispatch(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Share { path, principal, role } => {
+        Cmd::Share {
+            path,
+            principal,
+            role,
+        } => {
             let node = svc.stat(Ref::Path(&path)).await?;
             let grants = svc.share(&node.id, &principal, &role, &actor).await?;
-            if json { emit_json(&grants) } else { println!("{principal} is now {role} on {}", node.path); Ok(()) }
+            if json {
+                emit_json(&grants)
+            } else {
+                println!("{principal} is now {role} on {}", node.path);
+                Ok(())
+            }
         }
         Cmd::Unshare { path, principal } => {
             let node = svc.stat(Ref::Path(&path)).await?;
             let grants = svc.unshare(&node.id, &principal, &actor).await?;
-            if json { emit_json(&grants) } else { println!("removed {principal} from {}", node.path); Ok(()) }
+            if json {
+                emit_json(&grants)
+            } else {
+                println!("removed {principal} from {}", node.path);
+                Ok(())
+            }
         }
         Cmd::Doctor => doctor(&svc, &data_dir, json).await,
-        Cmd::Sync(_) | Cmd::Cleanup(_) | Cmd::Backup { .. } | Cmd::Service { .. } | Cmd::McpConfig { .. } | Cmd::Completions { .. } | Cmd::Update { .. } | Cmd::Uninstall => {
+        Cmd::Sync(_)
+        | Cmd::Cleanup(_)
+        | Cmd::Backup { .. }
+        | Cmd::Service { .. }
+        | Cmd::McpConfig { .. }
+        | Cmd::Completions { .. }
+        | Cmd::Update { .. }
+        | Cmd::Uninstall => {
             unreachable!("handled before the store is opened")
         }
     }
@@ -642,7 +792,10 @@ async fn serve(svc: Drawer, data_dir: &Path, args: ServeArgs) -> Result<()> {
     let ui_dir = match args.ui_dir {
         Some(dir) => {
             if !dir.join("index.html").exists() {
-                bail!("--ui-dir {} has no index.html; build the UI with `npm run build` in ui/", dir.display());
+                bail!(
+                    "--ui-dir {} has no index.html; build the UI with `npm run build` in ui/",
+                    dir.display()
+                );
             }
             Some(dir)
         }
@@ -660,16 +813,38 @@ async fn serve(svc: Drawer, data_dir: &Path, args: ServeArgs) -> Result<()> {
         Some(dir) => eprintln!("  ui     {}", dir.display()),
         None => eprintln!("  ui     not built; `cd ui && npm run build` to add it"),
     }
-    let password = std::env::var("DRAWER_ADMIN_PASSWORD").ok().filter(|s| !s.is_empty());
-    let secure_cookie = std::env::var("DRAWER_COOKIE_SECURE").is_ok_and(|s| s == "1" || s.eq_ignore_ascii_case("true"));
+    let password = std::env::var("DRAWER_ADMIN_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let secure_cookie = std::env::var("DRAWER_COOKIE_SECURE")
+        .is_ok_and(|s| s == "1" || s.eq_ignore_ascii_case("true"));
+    // Comma-separated allow-list; `None` keeps the permissive default for an open server.
+    let cors_origins = std::env::var("DRAWER_CORS_ORIGINS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(|origin| origin.trim().to_owned())
+                .filter(|origin| !origin.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|origins| !origins.is_empty());
     if password.is_some() {
-        eprintln!("  auth   admin password + cookie sessions{}", if token.is_some() { " (machine bearer token enabled)" } else { "" });
+        eprintln!(
+            "  auth   admin password + cookie sessions{}",
+            if token.is_some() {
+                " (machine bearer token enabled)"
+            } else {
+                ""
+            }
+        );
     } else if token.is_some() {
         eprintln!("  auth   bearer token required");
     } else if bound.ip().is_loopback() {
         eprintln!("  auth   none (loopback only)");
     } else {
-        eprintln!("  warning: no token set and listening beyond loopback; anyone who can reach this address can read and write");
+        eprintln!(
+            "  warning: no token set and listening beyond loopback; anyone who can reach this address can read and write"
+        );
     }
     let cleanup = svc.clone();
     cleanup.prune_expired_transfers().await?;
@@ -681,7 +856,14 @@ async fn serve(svc: Drawer, data_dir: &Path, args: ServeArgs) -> Result<()> {
             }
         }
     });
-    axum::serve(listener, crate::app_with_auth(svc, token, ui_dir, password, secure_cookie)).await?;
+    // `into_make_service_with_connect_info` hands each request the peer address, which the
+    // login limiter keys on. Callers that build the router themselves fall back gracefully.
+    axum::serve(
+        listener,
+        crate::app_with_auth(svc, token, ui_dir, password, secure_cookie, cors_origins)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -697,19 +879,34 @@ fn default_ui_dir() -> Option<PathBuf> {
 }
 
 fn mcp_config(format: McpFormat, data_dir: &Path, url: Option<&str>, name: &str) -> Result<String> {
-    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b)) {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+    {
         bail!("--name must be letters, digits, - or _, so every harness accepts it as a key");
     }
-    let exe = std::env::current_exe().context("finding the drawer binary")?.display().to_string();
+    let exe = std::env::current_exe()
+        .context("finding the drawer binary")?
+        .display()
+        .to_string();
     let data = absolute(data_dir).display().to_string();
     let args = json!(["--data-dir", data, "stdio"]);
     // Inline list for YAML and TOML; JSON string escapes are valid in both.
     let args_list = format!("[\"--data-dir\", {}, \"stdio\"]", json!(data));
     // Placeholder where the client has no documented env interpolation.
     let auth = json!({ "Authorization": "Bearer YOUR_TOKEN" });
-    let pretty = |v: serde_json::Value| -> Result<String> { Ok(format!("{}\n", serde_json::to_string_pretty(&v)?)) };
+    let pretty = |v: serde_json::Value| -> Result<String> {
+        Ok(format!("{}\n", serde_json::to_string_pretty(&v)?))
+    };
     let sh = |s: &str| {
-        if s.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-:@=".contains(&b)) { s.to_string() } else { format!("'{}'", s.replace('\'', "'\\''")) }
+        if s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-:@=".contains(&b))
+        {
+            s.to_string()
+        } else {
+            format!("'{}'", s.replace('\'', "'\\''"))
+        }
     };
     let token_note = "drop the Authorization header if the server runs without --token";
     Ok(match (format, url) {
@@ -723,8 +920,12 @@ fn mcp_config(format: McpFormat, data_dir: &Path, url: Option<&str>, name: &str)
              mcp_servers:\n  {name}:\n    url: {}\n    headers:\n      Authorization: \"Bearer YOUR_TOKEN\"\n",
             json!(url)
         ),
-        (McpFormat::Json, None) => pretty(json!({ "mcpServers": { name: { "command": exe, "args": args } } }))?,
-        (McpFormat::Json, Some(url)) => pretty(json!({ "mcpServers": { name: { "url": url, "headers": auth } } }))?,
+        (McpFormat::Json, None) => {
+            pretty(json!({ "mcpServers": { name: { "command": exe, "args": args } } }))?
+        }
+        (McpFormat::Json, Some(url)) => {
+            pretty(json!({ "mcpServers": { name: { "url": url, "headers": auth } } }))?
+        }
         (McpFormat::ClaudeCode, None) => format!(
             "claude mcp add --scope user {} -- {} --data-dir {} stdio\n",
             sh(name),
@@ -745,11 +946,15 @@ fn mcp_config(format: McpFormat, data_dir: &Path, url: Option<&str>, name: &str)
              [mcp_servers.{name}]\nurl = {}\nbearer_token_env_var = \"DRAWER_TOKEN\"\n",
             json!(url)
         ),
-        (McpFormat::Gemini, None) => pretty(json!({ "mcpServers": { name: { "command": exe, "args": args, "trust": false } } }))?,
-        (McpFormat::Gemini, Some(url)) => {
-            pretty(json!({ "mcpServers": { name: { "httpUrl": url, "headers": { "Authorization": "Bearer ${DRAWER_TOKEN}" } } } }))?
-        }
-        (McpFormat::Vscode, None) => pretty(json!({ "servers": { name: { "type": "stdio", "command": exe, "args": args } } }))?,
+        (McpFormat::Gemini, None) => pretty(
+            json!({ "mcpServers": { name: { "command": exe, "args": args, "trust": false } } }),
+        )?,
+        (McpFormat::Gemini, Some(url)) => pretty(
+            json!({ "mcpServers": { name: { "httpUrl": url, "headers": { "Authorization": "Bearer ${DRAWER_TOKEN}" } } } }),
+        )?,
+        (McpFormat::Vscode, None) => pretty(
+            json!({ "servers": { name: { "type": "stdio", "command": exe, "args": args } } }),
+        )?,
         (McpFormat::Vscode, Some(url)) => pretty(json!({
             "inputs": [{ "type": "promptString", "id": "drawer-token", "description": "Drawer bearer token", "password": true }],
             "servers": { name: { "type": "http", "url": url, "headers": { "Authorization": "Bearer ${input:drawer-token}" } } }
@@ -798,16 +1003,39 @@ async fn doctor(svc: &Drawer, data_dir: &Path, json: bool) -> Result<()> {
         }
         println!("{}", if healthy { "healthy" } else { "problems found" });
     }
-    if healthy { Ok(()) } else { Err(anyhow!("store is not healthy")) }
+    if healthy {
+        Ok(())
+    } else {
+        Err(anyhow!("store is not healthy"))
+    }
 }
 
-async fn set_starred(svc: &Drawer, path: &str, starred: bool, actor: &str, json: bool) -> Result<()> {
+async fn set_starred(
+    svc: &Drawer,
+    path: &str,
+    starred: bool,
+    actor: &str,
+    json: bool,
+) -> Result<()> {
     let node = svc.stat(Ref::Path(path)).await?;
-    let node = svc.update(&node.id, NodeUpdate { starred: Some(starred), ..NodeUpdate::default() }, actor).await?;
+    let node = svc
+        .update(
+            &node.id,
+            NodeUpdate {
+                starred: Some(starred),
+                ..NodeUpdate::default()
+            },
+            actor,
+        )
+        .await?;
     if json {
         emit_json(&node)
     } else {
-        println!("{} {}", if starred { "starred" } else { "unstarred" }, node.path);
+        println!(
+            "{} {}",
+            if starred { "starred" } else { "unstarred" },
+            node.path
+        );
         Ok(())
     }
 }
@@ -819,15 +1047,28 @@ async fn target_path(svc: &Drawer, dest: &str, name: &str) -> Result<String> {
         return Ok(format!("{dest}{name}"));
     }
     match svc.stat(Ref::Path(dest)).await {
-        Ok(node) if node.kind == "folder" => Ok(format!("{}/{name}", node.path.trim_end_matches('/'))),
+        Ok(node) if node.kind == "folder" => {
+            Ok(format!("{}/{name}", node.path.trim_end_matches('/')))
+        }
         Ok(_) | Err(Error::NotFound(_)) => Ok(dest.to_string()),
         Err(e) => Err(e.into()),
     }
 }
 
-fn write_opts(actor: &str, comment: &str, props: Vec<(String, String)>, if_head_revision: Option<i64>) -> WriteOpts {
+fn write_opts(
+    actor: &str,
+    comment: &str,
+    props: Vec<(String, String)>,
+    if_head_revision: Option<i64>,
+) -> WriteOpts {
     let properties: Properties = props.into_iter().collect();
-    WriteOpts { author: actor.into(), comment: comment.into(), properties, if_head_revision, required_parent: None }
+    WriteOpts {
+        author: actor.into(),
+        comment: comment.into(),
+        properties,
+        if_head_revision,
+        required_parent: None,
+    }
 }
 
 fn report_write(out: &WriteOutcome, json: bool) -> Result<()> {
@@ -837,7 +1078,10 @@ fn report_write(out: &WriteOutcome, json: bool) -> Result<()> {
     if out.new_revision {
         println!("{} saved as revision {}", out.node.path, out.revision);
     } else {
-        println!("{} unchanged, still revision {}", out.node.path, out.revision);
+        println!(
+            "{} unchanged, still revision {}",
+            out.node.path, out.revision
+        );
     }
     Ok(())
 }
@@ -868,18 +1112,31 @@ fn print_stat(n: &Node) {
 
 /// `tree`-style drawing of nodes from `walk`, which come depth first in path order.
 fn print_tree(nodes: &[Node], root: &str) {
-    let depth = |n: &Node| n.path[root.trim_end_matches('/').len()..].matches('/').count();
+    let depth = |n: &Node| {
+        n.path[root.trim_end_matches('/').len()..]
+            .matches('/')
+            .count()
+    };
     for (i, n) in nodes.iter().enumerate() {
         let d = depth(n);
         let mut prefix = String::new();
         for level in 1..d {
             // A vertical bar continues while a later node sits at this level under the same parent.
-            let open = nodes[i + 1..].iter().take_while(|m| depth(m) >= level).any(|m| depth(m) == level);
+            let open = nodes[i + 1..]
+                .iter()
+                .take_while(|m| depth(m) >= level)
+                .any(|m| depth(m) == level);
             prefix.push_str(if open { "│   " } else { "    " });
         }
-        let last = !nodes[i + 1..].iter().take_while(|m| depth(m) >= d).any(|m| depth(m) == d);
+        let last = !nodes[i + 1..]
+            .iter()
+            .take_while(|m| depth(m) >= d)
+            .any(|m| depth(m) == d);
         prefix.push_str(if last { "└── " } else { "├── " });
-        let rev = n.head_revision.map(|r| format!("  (r{r}, {})", size_label(n))).unwrap_or_default();
+        let rev = n
+            .head_revision
+            .map(|r| format!("  (r{r}, {})", size_label(n)))
+            .unwrap_or_default();
         println!("{prefix}{}{rev}", display_name(n));
     }
 }
@@ -906,7 +1163,12 @@ fn print_diff(diff: &str) {
 async fn memory(svc: &Drawer, action: MemoryAction, actor: &str, json: bool) -> Result<()> {
     use crate::vault;
     match action {
-        MemoryAction::Remember { name, content, tag, append } => {
+        MemoryAction::Remember {
+            name,
+            content,
+            tag,
+            append,
+        } => {
             let content = match content {
                 Some(c) => c,
                 None => {
@@ -919,7 +1181,15 @@ async fn memory(svc: &Drawer, action: MemoryAction, actor: &str, json: bool) -> 
             if json {
                 return emit_json(&out);
             }
-            println!("{} {}", if out["created"] == true { "saved" } else { "updated" }, out["path"].as_str().unwrap_or_default());
+            println!(
+                "{} {}",
+                if out["created"] == true {
+                    "saved"
+                } else {
+                    "updated"
+                },
+                out["path"].as_str().unwrap_or_default()
+            );
         }
         MemoryAction::Recall { query, tag, limit } => {
             let notes = vault::list(svc, tag.as_deref(), query.as_deref(), limit).await?;
@@ -944,7 +1214,14 @@ async fn memory(svc: &Drawer, action: MemoryAction, actor: &str, json: bool) -> 
             }
             print!("{}", d.content);
             if !d.backlinks.is_empty() {
-                println!("\nbacklinks: {}", d.backlinks.iter().map(|b| format!("[[{}]]", b.name)).collect::<Vec<_>>().join(" "));
+                println!(
+                    "\nbacklinks: {}",
+                    d.backlinks
+                        .iter()
+                        .map(|b| format!("[[{}]]", b.name))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
             }
         }
         MemoryAction::Forget { name } => {
@@ -952,7 +1229,11 @@ async fn memory(svc: &Drawer, action: MemoryAction, actor: &str, json: bool) -> 
             if json {
                 return emit_json(&out);
             }
-            println!("trashed {} (restore with: drawer restore {})", out["path"].as_str().unwrap_or_default(), out["id"].as_str().unwrap_or_default());
+            println!(
+                "trashed {} (restore with: drawer restore {})",
+                out["path"].as_str().unwrap_or_default(),
+                out["id"].as_str().unwrap_or_default()
+            );
         }
         MemoryAction::Graph => {
             let g = vault::graph(svc).await?;
@@ -962,15 +1243,46 @@ async fn memory(svc: &Drawer, action: MemoryAction, actor: &str, json: bool) -> 
             if g.nodes.is_empty() {
                 println!("no memories yet");
             }
-            let name = |id: &str| g.nodes.iter().find(|n| n.id == id).map(|n| if n.path.is_some() { n.name.clone() } else { format!("{}?", n.name) }).unwrap_or_default();
+            let name = |id: &str| {
+                g.nodes
+                    .iter()
+                    .find(|n| n.id == id)
+                    .map(|n| {
+                        if n.path.is_some() {
+                            n.name.clone()
+                        } else {
+                            format!("{}?", n.name)
+                        }
+                    })
+                    .unwrap_or_default()
+            };
             for n in g.nodes.iter().filter(|n| n.path.is_some()) {
-                let out: Vec<String> = g.edges.iter().filter(|e| e.0 == n.id).map(|e| name(&e.1)).collect();
-                let back: Vec<String> = g.edges.iter().filter(|e| e.1 == n.id).map(|e| name(&e.0)).collect();
+                let out: Vec<String> = g
+                    .edges
+                    .iter()
+                    .filter(|e| e.0 == n.id)
+                    .map(|e| name(&e.1))
+                    .collect();
+                let back: Vec<String> = g
+                    .edges
+                    .iter()
+                    .filter(|e| e.1 == n.id)
+                    .map(|e| name(&e.0))
+                    .collect();
                 println!("{}", n.name);
-                if !out.is_empty() { println!("  -> {}", out.join(", ")); }
-                if !back.is_empty() { println!("  <- {}", back.join(", ")); }
+                if !out.is_empty() {
+                    println!("  -> {}", out.join(", "));
+                }
+                if !back.is_empty() {
+                    println!("  <- {}", back.join(", "));
+                }
             }
-            let missing: Vec<&str> = g.nodes.iter().filter(|n| n.path.is_none()).map(|n| n.name.as_str()).collect();
+            let missing: Vec<&str> = g
+                .nodes
+                .iter()
+                .filter(|n| n.path.is_none())
+                .map(|n| n.name.as_str())
+                .collect();
             if !missing.is_empty() {
                 println!("\nlinked but not written: {}", missing.join(", "));
             }
@@ -998,7 +1310,11 @@ fn yes_no(b: bool) -> String {
 }
 
 fn display_name(n: &Node) -> String {
-    if n.kind == "folder" { format!("{}/", n.name) } else { n.name.clone() }
+    if n.kind == "folder" {
+        format!("{}/", n.name)
+    } else {
+        n.name.clone()
+    }
 }
 
 fn revision_label(n: &Node) -> String {
@@ -1030,7 +1346,10 @@ fn human_size(bytes: i64) -> String {
 
 /// The last segment of a Drawer path, ignoring a trailing slash.
 fn leaf(path: &str) -> &str {
-    path.trim_end_matches('/').rsplit('/').next().unwrap_or(path)
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
 }
 
 fn absolute(p: &Path) -> PathBuf {
@@ -1045,9 +1364,14 @@ fn default_data_dir() -> Result<PathBuf> {
         .map(PathBuf::from)
         .find(|home| home.is_absolute())
         .map(|home| home.join(".drawer"))
-        .ok_or_else(|| anyhow!("cannot determine home directory; set --data-dir or DRAWER_DATA_DIR"))
+        .ok_or_else(|| {
+            anyhow!("cannot determine home directory; set --data-dir or DRAWER_DATA_DIR")
+        })
 }
 
 fn default_author() -> String {
-    std::env::var("USER").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| "cli".into())
+    std::env::var("USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| "cli".into())
 }

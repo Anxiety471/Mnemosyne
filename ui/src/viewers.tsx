@@ -10,7 +10,7 @@ const escapeHtml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;")
 const MAX_HIGHLIGHT = 300_000;
 
 /** Plain textarea over a highlighted copy of the same text, with line numbers. */
-export function CodeEditor(props: { value: string; onChange: (v: string) => void; lang?: string; readOnly?: boolean }) {
+export function CodeEditor(props: { value: string; onChange: (v: string) => void; lang?: string | undefined; readOnly?: boolean }) {
   const { value, lang } = props;
   const [html, setHtml] = useState(() => escapeHtml(value));
   const pre = useRef<HTMLPreElement>(null);
@@ -250,12 +250,14 @@ export function PdfView({ blob }: { blob: Blob }) {
         const scale = width / base.width;
         const viewport = page.getViewport({ scale: scale * window.devicePixelRatio });
         const canvas = document.createElement("canvas");
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("This browser did not provide a 2D canvas for the PDF page.");
         canvas.width = viewport.width;
         canvas.height = viewport.height;
         canvas.style.width = `${base.width * scale}px`;
         canvas.setAttribute("aria-label", `Page ${n}`);
         host.current?.appendChild(canvas);
-        await page.render({ canvasContext: canvas.getContext("2d")!, viewport }).promise;
+        await page.render({ canvasContext: context, viewport }).promise;
       }
     })().catch((e) => live && setState({ error: String(e?.message ?? e) }));
     return () => {
@@ -340,10 +342,10 @@ export function DiffView({ diff }: { diff: string }) {
     <div className="diff" role="table" aria-label="Changes">
       {rows.map((r, i) => (
         <div key={i} className={`diff-row ${r.kind}`} role="row">
-          <span className="diff-num" aria-hidden="true">{r.a ?? ""}</span>
-          <span className="diff-num" aria-hidden="true">{r.b ?? ""}</span>
-          <span className="diff-sign" aria-hidden="true">{r.kind === "add" ? "+" : r.kind === "del" ? "−" : ""}</span>
-          <span className="diff-text">{r.text}</span>
+          <span className="diff-num" role="cell" aria-hidden="true">{r.a ?? ""}</span>
+          <span className="diff-num" role="cell" aria-hidden="true">{r.b ?? ""}</span>
+          <span className="diff-sign" role="cell" aria-hidden="true">{r.kind === "add" ? "+" : r.kind === "del" ? "−" : ""}</span>
+          <span className="diff-text" role="cell">{r.text}</span>
         </div>
       ))}
     </div>

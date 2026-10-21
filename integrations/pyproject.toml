@@ -1,0 +1,28 @@
+# Ruff for the Hermes plugin under integrations/.
+#
+# The plugin is loaded by path from a Hermes hook, so it is not an installed package and
+# `integrations/hermes/drawer-mirror/__init__.py` is loaded as a top-level module rather
+# than as a package member. The rules below are enabled for that reality; they are not
+# repo-wide Python policy.
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = [
+  "E501",
+  # `Optional[X]` is Hermes' own annotation style, and the plugin must run on older Pythons.
+  "UP045",
+  # Class-level mutable defaults here are deliberate test fixtures, initialised per test.
+  "RUF012",
+  # The plugin file needs no shebang: Hermes imports it, it is never executed directly.
+  "EXE001",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# `integrations/hermes/drawer-mirror/__init__.py` is loaded by file path, so its module
+# name is `drawer-mirror`, not a valid Python identifier.
+"integrations/hermes/drawer-mirror/__init__.py" = ["N999"]
+# Tests compare against recorded payloads.
+"integrations/**/tests/*" = ["B011"]

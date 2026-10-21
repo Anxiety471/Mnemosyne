@@ -1,8 +1,29 @@
-target
+# Keep secrets and local state out of the build context, and keep the context small.
+# Patterns match at any depth (Docker's .dockerignore is not anchored like .gitignore).
 .git
+.github
+.gitignore
+.dockerignore
+
+# Secrets: never let a build context carry credentials into an image layer.
 .env
-backups
-data
+.env.*
+!.env.example
+
+# Build output and vendored dependencies.
+target
 ui/node_modules
 ui/dist
+
+# Local data and archives.
+backups
+data
 *.tar.gz
+*.sha256
+
+# Local tooling and noise.
+.venv
+__pycache__
+*.pyc
+.vscode
+.idea

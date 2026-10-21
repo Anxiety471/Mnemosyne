@@ -7,6 +7,8 @@ on:
   workflow_dispatch:
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 jobs:
   # A push to main publishes the Cargo.toml version as vX.Y.Z when that release does not exist yet,
   # so bumping the version is the whole release process. A pushed v* tag releases as before.
@@ -87,6 +89,8 @@ jobs:
           name: drawer-${{ matrix.target }}
           path: drawer-${{ matrix.target }}.tar.gz
   release:
+    # Skipped when the tag already exists: no stale artifacts, no release edits.
+    if: needs.version.outputs.publish == 'true'
     needs: [version, binary]
     runs-on: ubuntu-latest
     steps:
@@ -103,3 +107,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.version.outputs.tag }}
         run: gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TAG" --generate-notes
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz

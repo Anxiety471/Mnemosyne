@@ -18,6 +18,8 @@ VERSION="${DRAWER_VERSION:-latest}"
 REF="${DRAWER_REF:-main}"
 PREFIX="${DRAWER_PREFIX:-$HOME/.local}"
 GITHUB_URL="${DRAWER_GITHUB_URL:-https://github.com}"
+# rustup's own installer fetches from here; its .sha256 sidecars are the checksums.
+RUSTUP_ROOT="${DRAWER_RUSTUP_ROOT:-https://static.rust-lang.org/rustup}"
 case "$GITHUB_URL" in
   https://*) PROTO="=https" ;;
   *) PROTO="=http,https" ;; # only reachable through the DRAWER_GITHUB_URL override
@@ -26,6 +28,9 @@ esac
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+# Same options everywhere, so a flaky network retries instead of falling back to a
+# multi-minute source build on the first hiccup.
+CURL="curl --retry 3 --retry-delay 5 --retry-all-errors --connect-timeout 15"
 
 detect_target() {
   os=$(uname -s)
@@ -51,8 +56,50 @@ sha256_check() {
   fi
 }
 
+file_sha256() {
+  # $1 = path
+  if have sha256sum; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+# A release name is predictable, so a missing archive is normal: no release for this
+# platform yet, and the caller falls back to a source build.
+fetch_optional() {
+  # $1 = url, $2 = destination
+  $CURL --proto "$PROTO" --tlsv1.2 -fsSL "$1" -o "$2" && return 0
+  say "not available: $1"
+  return 1
+}
+
+# A missing source archive or an unpackable one is a hard failure, not a fallback.
+fetch_required() {
+  # $1 = url, $2 = destination, $3 = what it is
+  $CURL --proto '=https' --tlsv1.2 -fsSL "$1" -o "$2" || die "could not download $3"
+}
+
+check_prefix() {
+  # Never let a too-broad prefix turn the install into a recursive delete.
+  case "$PREFIX" in
+    ""|/|/root|/home|/usr|/usr/local|/etc|/var|/opt|/bin|/sbin|/tmp|/dev|/proc|/sys) die "DRAWER_PREFIX is too broad: $PREFIX" ;;
+    */|*.|*..*) die "DRAWER_PREFIX must be a real directory path: $PREFIX" ;;
+  esac
+  # A relative prefix would land in whatever directory the installer happens to run from.
+  case "$PREFIX" in
+    /*) ;;
+    *) die "DRAWER_PREFIX must be an absolute path: $PREFIX" ;;
+  esac
+  if [ ! -d "$PREFIX" ]; then
+    say "creating $PREFIX"
+    mkdir -p "$PREFIX" || die "cannot create $PREFIX"
+  fi
+}
+
 install_tree() {
   # $1 = binary path, $2 = UI dist dir or empty
+  check_prefix
   mkdir -p "$PREFIX/bin"
   cp "$1" "$PREFIX/bin/drawer"
   chmod 755 "$PREFIX/bin/drawer"
@@ -72,26 +119,62 @@ install_release() {
   fi
   archive="drawer-$target.tar.gz"
   say "downloading $archive ($VERSION)"
-  curl --proto "$PROTO" --tlsv1.2 -fsSL "$base/$archive" -o "$tmp/$archive" || return 1
-  curl --proto "$PROTO" --tlsv1.2 -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS" || return 1
+  fetch_optional "$base/$archive" "$tmp/$archive" || return 1
+  fetch_optional "$base/SHA256SUMS" "$tmp/SHA256SUMS" \
+    || die "no SHA256SUMS for $VERSION; refusing an unverified install"
   grep " $archive\$" "$tmp/SHA256SUMS" > "$tmp/check" || die "$archive is not listed in SHA256SUMS"
   (cd "$tmp" && sha256_check check) || die "checksum mismatch for $archive"
-  tar -xzf "$tmp/$archive" -C "$tmp"
+  tar -xzf "$tmp/$archive" -C "$tmp" || die "cannot unpack $archive"
+  # A release for another platform can unpack to a differently named directory. Verify the
+  # layout before installing, and fail loudly instead of reporting success with nothing copied.
+  [ -f "$tmp/drawer-$target/drawer" ] || die "$archive does not contain drawer-$target/drawer"
   install_tree "$tmp/drawer-$target/drawer" "$tmp/drawer-$target/ui"
+}
+
+# rustup-init is downloaded and checksum-verified instead of piping a remote script
+# into a shell. rust publishes one .sha256 sidecar per rustup-init binary, which is
+# the same artifact `sh.rustup.rs` downloads.
+install_rustup() {
+  rust_arch=$(uname -m)
+  case "$rust_arch" in
+    x86_64 | amd64) rust_arch=x86_64 ;;
+    aarch64 | arm64) rust_arch=aarch64 ;;
+    *) die "no rustup-init is published for $(uname -m)" ;;
+  esac
+  rust_os=$(uname -s)
+  case "$rust_os" in
+    Linux) rust_os=unknown-linux-gnu ;;
+    Darwin) rust_os=apple-darwin ;;
+    *) die "no rustup-init is published for $rust_os" ;;
+  esac
+  triple="$rust_arch-$rust_os"
+  url="$RUSTUP_ROOT/dist/$triple/rustup-init"
+  say "downloading rustup-init for $triple"
+  fetch_required "$url" "$tmp/rustup-init" "rustup-init"
+  fetch_required "$url.sha256" "$tmp/rustup-init.sha256" "the rustup-init checksum"
+  expected=$(awk 'NR == 1 {print $1}' "$tmp/rustup-init.sha256")
+  case "$expected" in
+    ????????????????????????????????????????????????????????????????) ;;
+    *) die "the rustup-init checksum is malformed" ;;
+  esac
+  actual=$(file_sha256 "$tmp/rustup-init")
+  [ "$actual" = "$expected" ] || die "rustup-init checksum mismatch (expected $expected, got $actual)"
+  chmod 700 "$tmp/rustup-init"
+  "$tmp/rustup-init" -y --profile minimal --default-toolchain stable || die "rustup-init failed"
 }
 
 install_source() {
   if ! have cargo; then
     say "cargo not found, installing Rust with rustup (minimal profile)"
     have curl || die "curl is required"
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+    install_rustup
     # shellcheck disable=SC1091
     . "$HOME/.cargo/env"
   fi
   say "downloading source ($REF)"
-  curl --proto '=https' --tlsv1.2 -fsSL "https://codeload.github.com/$REPO/tar.gz/refs/heads/$REF" -o "$tmp/src.tar.gz"
+  fetch_required "https://codeload.github.com/$REPO/tar.gz/refs/heads/$REF" "$tmp/src.tar.gz" "the Drawer source"
   mkdir "$tmp/src"
-  tar -xzf "$tmp/src.tar.gz" -C "$tmp/src" --strip-components=1
+  tar -xzf "$tmp/src.tar.gz" -C "$tmp/src" --strip-components=1 || die "cannot unpack the source"
   ui_dist=""
   if have npm; then
     say "building the UI"
@@ -108,7 +191,17 @@ install_source() {
 main() {
   have curl || die "curl is required"
   have tar || die "tar is required"
+  # Reject a destructive prefix before any download or build starts.
+  case "$PREFIX" in
+    ""|/|/root|/home|/usr|/usr/local|/etc|/var|/opt|/bin|/sbin|/tmp|/dev|/proc|/sys) die "DRAWER_PREFIX is too broad: $PREFIX" ;;
+    */|*.|*..*) die "DRAWER_PREFIX must be a real directory path: $PREFIX" ;;
+  esac
+  case "$PREFIX" in
+    /*) ;;
+    *) die "DRAWER_PREFIX must be an absolute path: $PREFIX" ;;
+  esac
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/drawer-install.XXXXXX")
+  chmod 700 "$tmp"
   trap 'rm -rf "$tmp"' EXIT INT TERM
 
   target=$(detect_target)

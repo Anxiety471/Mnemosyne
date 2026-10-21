@@ -3,6 +3,8 @@ import { UploadLinksDialog } from "./UploadLinksDialog";
 import { ActivityPanel } from "./ActivityPanel";
 import { MemoryPanel } from "./MemoryPanel";
 import { MountsPanel } from "./MountsPanel";
+import { PermissionsDialog } from "./PermissionsDialog";
+import { Modal } from "./Modal";
 import { StoragePanel } from "./StoragePanel";
 import { TransfersPanel } from "./TransfersPanel";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -10,6 +12,7 @@ import { api, ApiError, Diff, DownloadLink, Node, Revision, SearchHit, setToken,
 import { Badge, extOf, fileType, isTextViewer } from "./filetypes";
 import { Icon } from "./icons";
 import { BinaryCard, CodeEditor, DiffView, DocxView, HtmlView, ImageView, Loading, MarkdownView, MediaView, PdfView, SheetView } from "./viewers";
+import { ErrorBoundary } from "./ErrorBoundary";
 
 const BADGE_ICON = {
   doc: "file", pdf: "pdf", sheet: "sheet", slides: "slides", image: "image",
@@ -54,7 +57,7 @@ type Dialog =
     }
   | { kind: "confirm"; title: string; body: string; action: string; danger?: boolean; submit: () => Promise<void> };
 
-type Toast = { text: string; tone: "ok" | "error"; action?: { label: string; run: () => void } };
+type Toast = { text: string; tone: "ok" | "error"; action?: { label: string; run: () => void } | undefined };
 
 type SortKey = "name" | "modified" | "size";
 type Sort = { key: SortKey; dir: 1 | -1 };
@@ -146,6 +149,8 @@ export function App() {
   const [nodes, setNodes] = useState<Node[]>([]);
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [loading, setLoading] = useState(true);
+  // Set when a load fails: the banner offers a retry, and polling surfaces after 3 misses.
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [query, setQuery] = useState(initial.view.kind === "search" ? initial.view.q : "");
   const [file, setFile] = useState<string | null>(initial.file);
   const [dirty, setDirty] = useState(false);
@@ -157,6 +162,7 @@ export function App() {
   const [storageManager, setStorageManager] = useState(false);
   const [transferManager, setTransferManager] = useState(false);
   const [shareTarget, setShareTarget] = useState<Node | null>(null);
+  const [permissionsTarget, setPermissionsTarget] = useState<Node | null>(null);
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [toast, setToast] = useState<Toast | null>(null);
   const [newMenu, setNewMenu] = useState(false);
@@ -207,6 +213,23 @@ export function App() {
     [notify],
   );
 
+  // Failures are counted, not shown one by one: a single dropped request is invisible, a
+  // broken server gets a banner. Any success clears the count and the banner.
+  const failures = useRef(0);
+  const silent = useCallback(
+    async (fn: () => Promise<void>) => {
+      try {
+        await fn();
+        failures.current = 0;
+        setLoadError(null);
+      } catch (e) {
+        failures.current += 1;
+        if (failures.current >= 3) setLoadError(e instanceof Error ? e.message : String(e));
+      }
+    },
+    [],
+  );
+
   const load = useCallback(async () => {
     if (view.kind === "drive") return api.tree(view.path);
     if (view.kind === "starred") return api.starred();
@@ -226,6 +249,8 @@ export function App() {
         try {
           if (view.kind === "search") setHits(await api.search(view.q));
           else setNodes((await load()) ?? []);
+          failures.current = 0;
+          setLoadError(null);
         } finally {
           setLoading(false);
         }
@@ -244,12 +269,10 @@ export function App() {
     if (file || view.kind === "search") return;
     const tick = async () => {
       if (document.visibilityState !== "visible" || dialogOpen) return;
-      try {
+      await silent(async () => {
         const next = await load();
         if (next) setNodes((prev) => (fingerprint(prev) === fingerprint(next) ? prev : next));
-      } catch {
-        // the next explicit action reports errors
-      }
+      });
     };
     const t = setInterval(tick, POLL_MS);
     document.addEventListener("visibilitychange", tick);
@@ -257,7 +280,7 @@ export function App() {
       clearInterval(t);
       document.removeEventListener("visibilitychange", tick);
     };
-  }, [file, view, load, dialogOpen]);
+  }, [file, view, load, silent, dialogOpen]);
 
   // A 401 means the server runs with a token this browser doesn't have yet.
   const asking = useRef(false);
@@ -401,37 +424,74 @@ export function App() {
   const uploadInput = useRef<HTMLInputElement>(null);
   const folderInput = useRef<HTMLInputElement>(null);
   const uploadAbort = useRef<AbortController | null>(null);
-  const [uploadProgress, setUploadProgress] = useState<{ name: string; completed: number; total: number; index: number; count: number } | null>(null);
+  // Batch progress: bytes sent across every selected file, plus the file being sent now.
+  const [uploadProgress, setUploadProgress] = useState<{ name: string; completed: number; total: number; index: number; count: number; bytes: number; bytesTotal: number } | null>(null);
+  // A batch the user paused. Held until it is resumed or the page goes away, so the progress bar
+  // (and its Resume button) stay on screen — a paused upload is not finished.
+  const [paused, setPaused] = useState<{ files: File[]; index: number; name: string; bytes: number; bytesTotal: number; indexInBatch: number; count: number } | null>(null);
   const [dropping, setDropping] = useState(false);
 
-  // Transfers are persisted server-side. Selecting the same file after interruption resumes it.
-  const upload = (files: File[]) =>
+  // `sent` carries the bytes already reported for each file, so the batch total stays right.
+  // `offset` is how many whole files the batch has already finished, which keeps the "n/m" label
+  // right after a resume, when only the remaining files are in scope.
+  const upload = (files: File[], sent: number[] = files.map(() => 0), offset = 0) =>
     run(async () => {
       if (!files.length || uploadAbort.current) return;
       const dir = currentDir;
       const ctrl = new AbortController();
       uploadAbort.current = ctrl;
-      let done = 0;
+      const bytesTotal = files.reduce((a, f) => a + f.size, 0);
       try {
-        for (const f of files) {
+        for (const [i, f] of files.entries()) {
           const name = f.webkitRelativePath || f.name;
-          const path = join(dir, name);
-          await api.upload(path, f, (completed, total) => {
-            setUploadProgress({ name, completed, total, index: done + 1, count: files.length });
+          await api.upload(join(dir, name), f, (bytes, _total, resumed) => {
+            sent[i] = resumed;
+            const done = sent.reduce((a, b) => a + b, 0);
+            setUploadProgress({
+              name,
+              completed: bytes,
+              total: f.size,
+              // Absolute position in the batch, so a resumed upload keeps counting up.
+              index: offset + i + 1,
+              count: files.length,
+              bytes: done,
+              bytesTotal,
+            });
           }, ctrl.signal);
-          done++;
         }
         if (view.kind !== "drive") setView({ kind: "drive", path: dir });
         else await refresh();
-        notify(done === 1 ? "Uploaded 1 file" : `Uploaded ${done} files`);
+        notify(files.length === 1 ? "Uploaded 1 file" : `Uploaded ${files.length} files`);
       } catch (e) {
-        if (ctrl.signal.aborted) notify("Upload paused. Select the same files to resume.");
-        else throw e;
+        if (ctrl.signal.aborted) {
+          // Snapshot where the batch stopped, so the bar can stay up with a Resume control
+          // instead of vanishing: the `finally` below clears the in-flight progress.
+          const resumeAt = sent.findIndex((n, i) => n < (files[i]?.size ?? 0));
+          setPaused({
+            files,
+            index: resumeAt,
+            name: uploadProgress?.name ?? files.at(resumeAt < 0 ? 0 : resumeAt)?.name ?? "",
+            bytes: uploadProgress?.bytes ?? 0,
+            bytesTotal: uploadProgress?.bytesTotal ?? bytesTotal,
+            indexInBatch: uploadProgress?.index ?? (resumeAt < 0 ? files.length : resumeAt + 1),
+            count: files.length,
+          });
+          notify("Upload paused. Use Resume to continue.");
+        } else throw e;
       } finally {
         uploadAbort.current = null;
         setUploadProgress(null);
       }
     });
+
+  const resumeUpload = () => {
+    if (!paused) return;
+    const { files, index } = paused;
+    const from = index < 0 ? 0 : index;
+    const sent = files.map((f, i) => (i < from ? f.size : 0));
+    setPaused(null);
+    upload(files.slice(from), sent.slice(from), from);
+  };
 
   const bulkTrash = () => setDialog({
     kind: "confirm",
@@ -716,7 +776,7 @@ export function App() {
           <button type="button" className="nav" title="Activity history" aria-label="Activity history" onClick={() => setActivityManager(true)}><Icon name="clock" /><span className="nav-label">Activity history</span></button>
           {(currentUser === "admin" || currentUser === null) && <button type="button" className="nav" title="Host folders" aria-label="Host folders" onClick={() => setMountManager(true)}><Icon name="folder" /><span className="nav-label">Host folders</span></button>}
           <button type="button" className="nav" title="Storage" aria-label="Storage" onClick={() => setStorageManager(true)}><Icon name="folder" /><span className="nav-label">Storage</span></button>
-          <button type="button" className="nav" title="Transfers" onClick={() => setTransferManager(true)}><Icon name="upload" /><span className="nav-label">Transfers</span></button>
+          <button type="button" className="nav" title="Transfers" aria-label="Transfers" onClick={() => setTransferManager(true)}><Icon name="upload" /><span className="nav-label">Transfers</span></button>
         </nav>
 
         <input
@@ -745,7 +805,11 @@ export function App() {
             upload(files);
           }}
         />
+        <a className="skip-link" href="#content">Skip to main content</a>
         <main
+          id="content"
+          aria-label={title ?? "Files"}
+          aria-busy={loading && !file}
           className={dropping ? "content dropping" : "content"}
           onDragOver={(e) => {
             if (file || !e.dataTransfer.types.includes("Files")) return;
@@ -756,21 +820,52 @@ export function App() {
             if (!e.currentTarget.contains(e.relatedTarget as globalThis.Node | null)) setDropping(false);
           }}
           onDrop={(e) => {
-            if (file) return;
+            if (file) {
+              // A file is open: dropping would replace the view, so say so instead of ignoring it.
+              e.preventDefault();
+              setDropping(false);
+              notify("Close this file to drop files here.", "error");
+              return;
+            }
             e.preventDefault();
             setDropping(false);
             upload(Array.from(e.dataTransfer.files));
           }}
         >
           {loading && !file && <div className="progress" aria-hidden="true" />}
-          {uploadProgress && (
+          <p className="sr-only" role="status">{loading && !file ? "Loading…" : ""}</p>
+          {(uploadProgress || paused) && (
             <div className="transfer-progress" role="status" aria-live="polite">
               <span className="transfer-label">
-                Uploading {uploadProgress.index}/{uploadProgress.count}: {uploadProgress.name}
-                {" · "}{Math.round((uploadProgress.completed / Math.max(1, uploadProgress.total)) * 100)}%
+                {uploadProgress ? (
+                  <>
+                    Uploading {uploadProgress.index}/{uploadProgress.count}: {uploadProgress.name}
+                    {" · "}{formatSize(uploadProgress.bytes)} of {formatSize(uploadProgress.bytesTotal)}
+                    {" · "}{Math.round((uploadProgress.bytes / Math.max(1, uploadProgress.bytesTotal)) * 100)}%
+                  </>
+                ) : paused ? (
+                  // A paused batch keeps its last position on screen so the Resume control stays
+                  // reachable; without this the bar would unmount and Resume with it.
+                  <>
+                    Paused at {paused.indexInBatch}/{paused.count}: {paused.name}
+                    {" · "}{formatSize(paused.bytes)} of {formatSize(paused.bytesTotal)}
+                  </>
+                ) : null}
               </span>
-              <progress value={uploadProgress.completed} max={Math.max(1, uploadProgress.total)} />
-              <button className="btn" type="button" onClick={() => uploadAbort.current?.abort()}>Pause</button>
+              <progress
+                value={uploadProgress?.bytes ?? paused?.bytes ?? 0}
+                max={uploadProgress?.bytesTotal ?? paused?.bytesTotal ?? 1}
+                aria-label="Upload progress"
+              />
+              {uploadProgress && <button className="btn" type="button" onClick={() => uploadAbort.current?.abort()}>Pause</button>}
+              {paused && <button className="btn primary" type="button" onClick={resumeUpload}>Resume</button>}
+            </div>
+          )}
+          {loadError && (
+            <div className="banner" role="alert">
+              <span>Couldn't reload — {loadError}</span>
+              <span className="spacer" />
+              <button className="btn" type="button" onClick={() => refresh()}>Retry</button>
             </div>
           )}
           {dropping && (
@@ -844,6 +939,7 @@ export function App() {
                   move={move}
                   copy={copy}
                   share={(n) => setShareTarget(n)}
+                  permissions={(n) => setPermissionsTarget(n)}
                   download={(n) => run(() => n.kind === "folder" ? api.downloadArchive([n.id]) : api.download(n.path))}
                   trash={(n) => trash(n)}
                   restore={restore}
@@ -867,12 +963,13 @@ export function App() {
       {usersManager && <UsersPanel close={() => setUsersManager(false)} />}
       {memoryManager && <MemoryPanel close={() => setMemoryManager(false)} />}
       {activityManager && <ActivityPanel close={() => setActivityManager(false)} />}
-      {mountManager && <MountsPanel close={() => { setMountManager(false); void refresh(); }} />}
+      {mountManager && <MountsPanel close={() => { setMountManager(false); void refresh(); }} currentDir={currentDir} />}
       {storageManager && <StoragePanel close={() => setStorageManager(false)} />}
       {transferManager && <TransfersPanel close={() => setTransferManager(false)} />}
       {shareTarget && (
         shareTarget.kind === "folder" ? <UploadLinksDialog node={shareTarget} close={() => setShareTarget(null)} /> : <ShareLinksDialog node={shareTarget} close={() => setShareTarget(null)} notify={notify} />
       )}
+      {permissionsTarget && <PermissionsDialog node={permissionsTarget} close={() => setPermissionsTarget(null)} notify={notify} />}
       {dialog && (
         <DialogBox
           dialog={dialog}
@@ -935,6 +1032,7 @@ function FileTable(props: {
   move: (n: Node) => void;
   copy: (n: Node) => void;
   share: (n: Node) => void;
+  permissions: (n: Node) => void;
   download: (n: Node) => void;
   trash: (n: Node) => void;
   restore: (n: Node) => void;
@@ -942,7 +1040,34 @@ function FileTable(props: {
 }) {
   const { nodes, mode, sort } = props;
   const [menu, setMenu] = useState<string | null>(null);
+  const trigger = useRef<HTMLButtonElement | null>(null);
+  const items = useRef<Array<HTMLButtonElement | null>>([]);
   if (!props.loading && nodes.length === 0) return <div className="empty">{props.empty}</div>;
+
+  const close = () => {
+    setMenu(null);
+    // Put focus back on the trigger so keyboard users are not dropped at the top of the page.
+    trigger.current?.focus();
+  };
+
+  /** Roving tabindex: one item is in the tab order, arrows move between items. */
+  const onMenuKey = (e: React.KeyboardEvent) => {
+    const buttons = items.current.filter((b): b is HTMLButtonElement => !!b);
+    if (!buttons.length) return;
+    const at = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    const focusAt = (index: number) => buttons.at(index)?.focus();
+    const step = (delta: number) => focusAt(at < 0 ? 0 : (at + delta + buttons.length) % buttons.length);
+    if (e.key === "ArrowDown") { e.preventDefault(); step(1); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); step(-1); }
+    else if (e.key === "Home") { e.preventDefault(); focusAt(0); }
+    else if (e.key === "End") { e.preventDefault(); focusAt(-1); }
+    else if (e.key === "Escape") { e.preventDefault(); close(); }
+  };
+
+  const openMenu = (id: string, ref: HTMLButtonElement | null) => {
+    trigger.current = ref;
+    setMenu(id);
+  };
 
   const head = (key: SortKey, label: string, className: string) => {
     const on = sort?.key === key;
@@ -964,7 +1089,7 @@ function FileTable(props: {
 
   const where = (n: Node) => (parentOf(n.path) === "/" ? "My Drawer" : parentOf(n.path));
   const pick = (fn: (n: Node) => void, n: Node) => () => {
-    setMenu(null);
+    close();
     fn(n);
   };
 
@@ -982,7 +1107,7 @@ function FileTable(props: {
           <th className="col-md">{mode === "drive" ? "Last change by" : "Location"}</th>
           {head("modified", mode === "trash" ? "Trashed" : "Modified", "col-sm")}
           {head("size", "Size", "col-sm num")}
-          <th className="col-actions" aria-label="Actions" />
+          <th className="col-actions"><span className="sr-only">Actions</span></th>
         </tr>
       </thead>
       <tbody>
@@ -994,7 +1119,7 @@ function FileTable(props: {
             onContextMenu={(e) => {
               if (mode === "trash") return;
               e.preventDefault();
-              setMenu(n.id);
+              openMenu(n.id, null);
             }}
           >
             <td className="col-select">
@@ -1038,33 +1163,37 @@ function FileTable(props: {
                     <button className="icon-btn" title={n.starred ? "Unstar" : "Star"} aria-label={n.starred ? `Unstar ${n.name}` : `Star ${n.name}`} onClick={() => props.star(n)}>
                       <Icon name="star" size={18} filled={n.starred} />
                     </button>
-                    <button className="icon-btn" title="Move to trash" aria-label={`Move ${n.name} to trash`} onClick={() => props.trash(n)}>
-                      <Icon name="trash" size={18} />
-                    </button>
                     <div className="row-menu">
                       <button
+                        ref={(el) => {
+                          if (menu === n.id) trigger.current = el;
+                        }}
                         className="icon-btn"
                         title="More actions"
                         aria-label={`More actions for ${n.name}`}
                         aria-haspopup="menu"
                         aria-expanded={menu === n.id}
-                        onClick={() => setMenu(menu === n.id ? null : n.id)}
+                        onClick={(e) => {
+                          if (menu === n.id) close();
+                          else openMenu(n.id, e.currentTarget);
+                        }}
                       >
                         <Icon name="more" size={18} />
                       </button>
                       {menu === n.id && (
                         <>
-                          <div className="scrim" onClick={() => setMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMenu(null); }} />
-                          <div className="menu right" role="menu" onKeyDown={(e) => e.key === "Escape" && setMenu(null)}>
-                            <button role="menuitem" autoFocus onClick={pick(props.open, n)}>
+                          <div className="scrim" onClick={close} onContextMenu={(e) => { e.preventDefault(); close(); }} />
+                          <div className="menu right" role="menu" aria-label={`Actions for ${n.name}`} onKeyDown={onMenuKey}>
+                            <button role="menuitem" ref={(el) => { items.current[0] = el; if (el) el.focus(); }} onClick={pick(props.open, n)}>
                               <Icon name={n.kind === "folder" ? "folder" : "eye"} size={18} /> Open
                             </button>
-                            <button role="menuitem" onClick={pick(props.rename, n)}>
+                            <button role="menuitem" ref={(el) => { items.current[1] = el; }} onClick={pick(props.rename, n)}>
                               <Icon name="edit" size={18} /> Rename
                             </button>
-                            <button role="menuitem" onClick={pick(props.move, n)}>
+                            <button role="menuitem" ref={(el) => { items.current[2] = el; }} onClick={pick(props.move, n)}>
                               <Icon name="move" size={18} /> Move
                             </button>
+                            {n.kind === "folder" && <button role="menuitem" ref={(el) => { items.current[3] = el; }} onClick={pick(props.permissions, n)}><Icon name="key" size={18} /> Manage access</button>}
                             {n.kind === "folder" && <button role="menuitem" onClick={pick(props.share, n)}><Icon name="upload" size={18} /> Create upload-only link</button>}
                             {n.kind === "folder" && <button role="menuitem" onClick={pick(props.download, n)}><Icon name="download" size={18} /> Download folder as ZIP</button>}
                             {n.kind === "file" && (
@@ -1077,6 +1206,9 @@ function FileTable(props: {
                                 </button>
                                 <button role="menuitem" onClick={pick(props.share, n)}>
                                   <Icon name="copy" size={18} /> Share download link
+                                </button>
+                                <button role="menuitem" onClick={pick(props.permissions, n)}>
+                                  <Icon name="key" size={18} /> Manage access
                                 </button>
                               </>
                             )}
@@ -1371,7 +1503,7 @@ function Editor(props: {
       <div className="editor-body">
         <div className="editor-main">
           {remote && dirty && (
-            <div className="banner">
+            <div className="banner" role="alert">
               <span>
                 {remote.modified_by ?? "Someone"} saved revision {remote.head_revision} while you were editing. Saving now would be
                 refused, so copy anything you want to keep first.
@@ -1397,7 +1529,7 @@ function Editor(props: {
             </div>
           )}
           {viewing && (
-            <div className="banner">
+            <div className="banner" role="status" aria-live="polite">
               <span>
                 Viewing revision {viewing.revision} by {viewing.author}, {formatWhen(viewing.created_at)}. Read-only.
               </span>
@@ -1425,7 +1557,14 @@ function Editor(props: {
               </button>
             </div>
           )}
-          <div className="viewer">{body}</div>
+          <div className="viewer">
+            <ErrorBoundary
+              message={`This file can't be previewed`}
+              {...(node ? { onDownload: () => run(() => api.download(path, viewing?.revision)) } : {})}
+            >
+              {body}
+            </ErrorBoundary>
+          </div>
           {viewing === null && !comparing && editable && !showPreview && (
             <div className="save-bar">
               <input
@@ -1524,6 +1663,7 @@ function ShareLinksDialog({
   notify: (message: string, tone?: "ok" | "error") => void;
 }) {
   const [downloadLimit, setDownloadLimit] = useState("");
+  const [days, setDays] = useState(7);
   const [pinRevision, setPinRevision] = useState(false);
   const [links, setLinks] = useState<DownloadLink[]>([]);
   const [newUrl, setNewUrl] = useState("");
@@ -1552,7 +1692,8 @@ function ShareLinksDialog({
   };
 
   const create = () => perform(async () => {
-    const link = await api.createLink(node.id, 7, pinRevision ? node.head_revision ?? undefined : undefined, downloadLimit ? Number(downloadLimit) : undefined);
+    const ttl = Math.min(30, Math.max(1, Math.round(days) || 7));
+    const link = await api.createLink(node.id, ttl, pinRevision ? node.head_revision ?? undefined : undefined, downloadLimit ? Number(downloadLimit) : undefined);
     setNewUrl(`${window.location.origin}${link.url_path}`);
     setLinks(await api.links(node.id));
     notify("Link created. Copy it now; Drawer will not display this secret again.");
@@ -1573,47 +1714,44 @@ function ShareLinksDialog({
     setLinks((prev) => prev.filter((link) => link.id !== id));
     notify("Download link revoked");
   });
-
   return (
-    <div className="modal-scrim" onMouseDown={close}>
-      <section className="modal share-modal" role="dialog" aria-modal="true" aria-labelledby="share-title" onMouseDown={(e) => e.stopPropagation()}>
-        <h3 id="share-title">Share “{node.name}”</h3>
-        <p className="muted small">
-          Anyone with the link can download this file for 7 days without your Drawer access token.
-          Choose whether the link follows the latest version or stays on the current revision. Revoke it to disable access.
-        </p>
-        <label>Download limit (blank for unlimited)<input type="number" min="1" max="1000000" value={downloadLimit} onChange={(e) => setDownloadLimit(e.target.value)} /></label>
-        <label><span><input type="checkbox" checked={pinRevision} onChange={(e) => setPinRevision(e.target.checked)} /> Keep this link on revision {node.head_revision}</span></label>
-        <div className="modal-actions">
-          <button type="button" className="btn primary" disabled={busy || loading} onClick={create}>
-            Create 7-day link
-          </button>
-        </div>
-        {newUrl && (
-          <div className="share-created">
-            <label htmlFor="share-url" className="muted small">Copy this link now; it is only shown once.</label>
-            <div className="share-copy-row">
-              <input id="share-url" ref={input} readOnly value={newUrl} onFocus={(e) => e.currentTarget.select()} />
-              <button className="btn" type="button" disabled={busy} onClick={copy}>Copy</button>
-            </div>
+    <Modal title={`Share “${node.name}”`} labelledBy="share-title" onClose={close} className="share-modal">
+      <p className="muted small">
+        Anyone with the link can download this file without your Drawer access token, for 1 to 30 days.
+        Choose whether the link follows the latest version or stays on the current revision. Revoke it to disable access.
+      </p>
+      <label>Days <input aria-label="Link days" type="number" min="1" max="30" value={days} onChange={(e) => setDays(Number(e.target.value))} /></label>
+      <label>Download limit (blank for unlimited)<input type="number" min="1" max="1000000" value={downloadLimit} onChange={(e) => setDownloadLimit(e.target.value)} /></label>
+      <label><span><input type="checkbox" checked={pinRevision} onChange={(e) => setPinRevision(e.target.checked)} /> Keep this link on revision {node.head_revision}</span></label>
+      <div className="modal-actions">
+        <button type="button" className="btn primary" disabled={busy || loading} onClick={create}>
+          Create {Math.min(30, Math.max(1, Math.round(days) || 7))}-day link
+        </button>
+      </div>
+      {newUrl && (
+        <div className="share-created">
+          <label htmlFor="share-url" className="muted small">Copy this link now; it is only shown once.</label>
+          <div className="share-copy-row">
+            <input id="share-url" ref={input} readOnly value={newUrl} onFocus={(e) => e.currentTarget.select()} />
+            <button className="btn" type="button" disabled={busy} onClick={copy}>Copy</button>
           </div>
-        )}
-        <h4>Existing links</h4>
-        {loading ? <p className="muted small">Loading links…</p> : links.length === 0 ? <p className="muted small">No links created yet.</p> : (
-          <ul className="share-links">
-            {links.map((link) => (
-              <li key={link.id}>
-                <span className="muted small">
-                  {link.max_downloads ? `${Math.max(0, link.max_downloads - link.downloads)} downloads left · ` : ""}{link.revision ? `Revision ${link.revision} · ` : "Latest version · "}{new Date(link.expires_at).getTime() < Date.now() ? "Expired" : "Expires"}: {new Date(link.expires_at).toLocaleString()}
-                </span>
-                <button type="button" className="btn danger" disabled={busy} onClick={() => revoke(link.id)}>Revoke</button>
-              </li>
-            ))}
-          </ul>
-        )}
-        <div className="modal-actions"><button className="btn" type="button" onClick={close}>Done</button></div>
-      </section>
-    </div>
+        </div>
+      )}
+      <h4>Existing links</h4>
+      {loading ? <p className="muted small">Loading links…</p> : links.length === 0 ? <p className="muted small">No links created yet.</p> : (
+        <ul className="share-links">
+          {links.map((link) => (
+            <li key={link.id}>
+              <span className="muted small">
+                {link.max_downloads ? `${Math.max(0, link.max_downloads - link.downloads)} downloads left · ` : ""}{link.revision ? `Revision ${link.revision} · ` : "Latest version · "}{new Date(link.expires_at).getTime() < Date.now() ? "Expired" : "Expires"}: {new Date(link.expires_at).toLocaleString()}
+              </span>
+              <button type="button" className="btn danger" disabled={busy} onClick={() => revoke(link.id)}>Revoke</button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="modal-actions"><button className="btn" type="button" onClick={close}>Done</button></div>
+    </Modal>
   );
 }
 
@@ -1622,6 +1760,7 @@ function DialogBox({ dialog, close, notify }: { dialog: Dialog; close: () => voi
   const [username, setUsername] = useState("admin");
   const [busy, setBusy] = useState(false);
   const input = useRef<HTMLInputElement>(null);
+  const titleId = "dialog-title";
 
   useEffect(() => {
     const el = input.current;
@@ -1631,12 +1770,6 @@ function DialogBox({ dialog, close, notify }: { dialog: Dialog; close: () => voi
     const dot = dialog.kind === "prompt" && dialog.selectStem ? el.value.lastIndexOf(".") : -1;
     el.setSelectionRange(0, dot > 0 ? dot : el.value.length);
   }, [dialog]);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && close();
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [close]);
 
   const submit = async () => {
     if (dialog.kind === "prompt" && !value.trim()) return;
@@ -1652,19 +1785,13 @@ function DialogBox({ dialog, close, notify }: { dialog: Dialog; close: () => voi
   };
 
   return (
-    <div className="modal-scrim" onMouseDown={close}>
+    <Modal title={dialog.title} labelledBy={titleId} onClose={close} initialFocus={dialog.kind === "prompt" ? input : undefined}>
       <form
-        className="modal"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="dialog-title"
-        onMouseDown={(e) => e.stopPropagation()}
         onSubmit={(e) => {
           e.preventDefault();
           submit();
         }}
       >
-        <h3 id="dialog-title">{dialog.title}</h3>
         {dialog.kind === "prompt" && dialog.username && <label>Username<input aria-label="Username" autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} /></label>}
         {dialog.kind === "prompt" ? (
           <label>
@@ -1695,6 +1822,6 @@ function DialogBox({ dialog, close, notify }: { dialog: Dialog; close: () => voi
           </button>
         </div>
       </form>
-    </div>
+    </Modal>
   );
 }

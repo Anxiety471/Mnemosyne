@@ -33,20 +33,42 @@ pub struct NewDownloadLink {
 impl Drawer {
     /// Only files can be linked. A link grants read-only access to the latest revision,
     /// and cannot be used to browse other files or invoke the authenticated API.
-    pub async fn create_download_link(&self, id: &str, actor: &str, days: i64) -> Result<NewDownloadLink> {
-        self.create_download_link_with_revision(id, actor, days, None).await
+    pub async fn create_download_link(
+        &self,
+        id: &str,
+        actor: &str,
+        days: i64,
+    ) -> Result<NewDownloadLink> {
+        self.create_download_link_with_revision(id, actor, days, None)
+            .await
     }
 
-    pub async fn create_download_link_with_revision(&self, id: &str, actor: &str, days: i64, revision: Option<i64>) -> Result<NewDownloadLink> {
-        self.create_download_link_with_options(id, actor, days, revision, None).await
+    pub async fn create_download_link_with_revision(
+        &self,
+        id: &str,
+        actor: &str,
+        days: i64,
+        revision: Option<i64>,
+    ) -> Result<NewDownloadLink> {
+        self.create_download_link_with_options(id, actor, days, revision, None)
+            .await
     }
 
-    pub async fn create_download_link_with_options(&self, id: &str, actor: &str, days: i64, revision: Option<i64>, max_downloads: Option<i64>) -> Result<NewDownloadLink> {
+    pub async fn create_download_link_with_options(
+        &self,
+        id: &str,
+        actor: &str,
+        days: i64,
+        revision: Option<i64>,
+        max_downloads: Option<i64>,
+    ) -> Result<NewDownloadLink> {
         if max_downloads.is_some_and(|n| !(1..=1_000_000).contains(&n)) {
             return Err(Error::Invalid("download limit must be 1 to 1000000".into()));
         }
         if !(1..=30).contains(&days) {
-            return Err(Error::Invalid("link expiry must be between 1 and 30 days".into()));
+            return Err(Error::Invalid(
+                "link expiry must be between 1 and 30 days".into(),
+            ));
         }
         let _guard = self.write_lock.lock().await;
         let node = self.stat(Ref::Id(id)).await?;
@@ -63,7 +85,8 @@ impl Drawer {
         let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
         let link_id = Uuid::new_v4().to_string();
         let created_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-        let expires_at = (Utc::now() + Duration::days(days)).to_rfc3339_opts(SecondsFormat::Millis, true);
+        let expires_at =
+            (Utc::now() + Duration::days(days)).to_rfc3339_opts(SecondsFormat::Millis, true);
         let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO download_links (id, node_id, token_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)")
             .bind(&link_id)
@@ -75,14 +98,28 @@ impl Drawer {
             .await?;
         if let Some(revision) = revision {
             sqlx::query("INSERT INTO download_link_revisions (link_id, revision) VALUES (?, ?)")
-                .bind(&link_id).bind(revision).execute(&mut *tx).await?;
+                .bind(&link_id)
+                .bind(revision)
+                .execute(&mut *tx)
+                .await?;
         }
         if let Some(max_downloads) = max_downloads {
             sqlx::query("INSERT INTO download_link_limits (link_id, max_downloads) VALUES (?, ?)")
-                .bind(&link_id).bind(max_downloads).execute(&mut *tx).await?;
+                .bind(&link_id)
+                .bind(max_downloads)
+                .execute(&mut *tx)
+                .await?;
         }
         tx.commit().await?;
-        Ok(NewDownloadLink { id: link_id, token, created_at, expires_at, revision, max_downloads, downloads: 0 })
+        Ok(NewDownloadLink {
+            id: link_id,
+            token,
+            created_at,
+            expires_at,
+            revision,
+            max_downloads,
+            downloads: 0,
+        })
     }
 
     pub async fn list_download_links(&self, id: &str, actor: &str) -> Result<Vec<DownloadLink>> {
@@ -96,7 +133,14 @@ impl Drawer {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|r| DownloadLink { id: r.get("id"), created_at: r.get("created_at"), expires_at: r.get("expires_at"), revision: r.get("revision"), max_downloads: r.get("max_downloads"), downloads: r.get("downloads") })
+            .map(|r| DownloadLink {
+                id: r.get("id"),
+                created_at: r.get("created_at"),
+                expires_at: r.get("expires_at"),
+                revision: r.get("revision"),
+                max_downloads: r.get("max_downloads"),
+                downloads: r.get("downloads"),
+            })
             .collect())
     }
 
@@ -118,7 +162,10 @@ impl Drawer {
 
     /// No actor is trusted here. The only credential is the 64-character link secret.
     /// Trashing a file or any ancestor makes its links unusable until restored.
-    pub async fn download_link_file(&self, token: &str) -> Result<(String, i64, std::path::PathBuf)> {
+    pub async fn download_link_file(
+        &self,
+        token: &str,
+    ) -> Result<(String, i64, std::path::PathBuf)> {
         if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(Error::NotFound("download link".into()));
         }
@@ -145,7 +192,9 @@ impl Drawer {
         if row.get::<Option<i64>, _>("max_downloads").is_some() {
             let used = sqlx::query("UPDATE download_link_limits SET downloads = downloads + 1 WHERE link_id = ? AND downloads < max_downloads")
                 .bind(row.get::<String, _>("id")).execute(&self.pool).await?.rows_affected();
-            if used == 0 { return Err(Error::NotFound("download link".into())); }
+            if used == 0 {
+                return Err(Error::NotFound("download link".into()));
+            }
         }
         Ok((node.name, rev.size, file_path))
     }

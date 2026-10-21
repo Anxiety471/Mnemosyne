@@ -169,6 +169,16 @@ Use the REST API at `/drawer/v1` (see the README). Files are plain HTTP: `PUT /d
 
 Shell-driven agents can also call the CLI directly: `drawer edit`, `drawer diff`, `drawer tree` and `drawer recent` all take `--json`.
 
+## Local folder integration
+
+Agents that need a real directory rather than an MCP call have two operator routes on the server.
+
+**`drawer sync`** mirrors a local folder with a remote Drawer folder. It hashes local files incrementally, uses guarded resumable uploads, pins downloads to immutable revisions and verifies SHA-256 before installing. Pending uploads survive restarts, and `--watch` retries offline failures every 30 seconds. It is deliberately a content sync, not a filesystem mirror: deletions and renames do not propagate, and the remote wins when both sides change. See [Desktop folder sync](../README.md#desktop-folder-sync).
+
+**`drawer mount`** registers a read-only host folder so any authenticated operator can browse it in the UI and import files into Drawer. Registration needs local CLI access; HTTP clients only see registered roots. Imports stream through a temporary file, are capped at 512 MiB, and never overwrite an existing Drawer file. Capability-based access prevents parent traversal and symlink escapes, and symlinks are omitted from listings. See [Read-only host folder mounts](../README.md#read-only-host-folder-mounts).
+
+Neither route is an MCP tool; a harness reaches them through a shell if at all.
+
 ## Limits worth knowing
 
 - Actors are self-declared through the `author` argument, so sharing grants are cooperative, not a security boundary. Put Drawer behind `--token` and a private network.
