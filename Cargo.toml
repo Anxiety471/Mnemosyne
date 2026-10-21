@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 argon2 = "0.5.3"
-async_zip = { version = "0.0.18", features = ["tokio", "deflate"] }
+async_zip = { version = "0.0.19", features = ["tokio", "deflate"] }
 axum = "0.8.9"
 base64 = "0.22"
 cap-std = "3.4.5"
